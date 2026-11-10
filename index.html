@@ -1,0 +1,1548 @@
+// @ts-nocheck
+import React, { useState, useEffect, useRef, createContext, useContext } from 'react';
+import {
+  Wrench, Camera, Palette, Calculator, Scale, Compass, MapPin, Cog, Fuel, Calendar,
+  ShieldAlert, ShieldCheck, LogIn, LogOut, User, LayoutDashboard, Globe, Menu, X,
+  ArrowRight, CheckCircle2, AlertTriangle, Sparkles, Car, ChevronRight, ChevronDown,
+  Send, Key, Loader2, Check, Lock, Stethoscope, Tag, Rocket, PlayCircle, Bot, Info,
+  Home as HomeIcon, Trash2, Plus, Download, Copy, Zap, Mail, Navigation, RefreshCw
+} from 'lucide-react';
+
+/* =====================================================================
+   CONFIG  — edit these values
+   ===================================================================== */
+const CONFIG = {
+  API_BASE: 'https://generativelanguage.googleapis.com/v1beta', // point to your own proxy in production
+  TEXT_MODEL: 'gemini-2.5-flash',
+  IMAGE_MODEL: 'gemini-2.5-flash-image',
+  DEFAULT_API_KEY: '',                 // optional: leave empty and let each user paste their own key
+  CONTACT_EMAIL: 'jamali@automind.ai', // contact form opens the user's email app addressed here
+  PAYMENT_LINKS: { Premium: '', Professional: '' }, // paste Stripe/PayPal payment-link URLs here
+};
+
+const PLANS = {
+  Free: { price: 0, scans: 5, cars: 2 },
+  Premium: { price: 14.99, scans: Infinity, cars: Infinity },
+  Professional: { price: 49.99, scans: Infinity, cars: Infinity },
+};
+
+const LANG_NAMES = { en: 'English', ur: 'Urdu', ar: 'Arabic' };
+
+/* =====================================================================
+   GEMINI HELPERS
+   ===================================================================== */
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function fetchWithBackoff(url, options, maxRetries = 3) {
+  let delay = 1000;
+  let res;
+  for (let i = 0; i <= maxRetries; i++) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 60000); // never hang forever
+    try {
+      res = await fetch(url, { ...options, signal: ctrl.signal });
+      clearTimeout(timer);
+      if ((res.status === 429 || res.status === 503) && i < maxRetries) {
+        await sleep(delay);
+        delay *= 2;
+        continue;
+      }
+      return res;
+    } catch (err) {
+      clearTimeout(timer);
+      if (err?.name === 'AbortError') throw new Error('The AI took too long to respond. Please try again.');
+      if (i === maxRetries) throw err;
+      await sleep(delay);
+      delay *= 2;
+    }
+  }
+  return res;
+}
+
+// Optional proxy (e.g. a free Cloudflare Worker, see gemini-proxy-worker.js) so the app works without a VPN
+let PROXY_URL = '';
+
+// Remove spaces/quotes from a pasted key and reject non-English characters (they break HTTP headers)
+function cleanKey(k) {
+  const s = String(k || '').replace(/[\s"'`]/g, '');
+  if (!s) return '';
+  if (/[^\x21-\x7E]/.test(s)) throw new Error('BAD_KEY_FORMAT');
+  return s;
+}
+
+async function geminiCall(model, payload, apiKey) {
+  const key = cleanKey(apiKey || CONFIG.DEFAULT_API_KEY);
+  if (!key) throw new Error('NO_KEY');
+  const base = PROXY_URL ? `${PROXY_URL.replace(/\/+$/, '')}/v1beta` : CONFIG.API_BASE;
+  const url = `${base}/models/${model}:generateContent`;
+  const body = JSON.stringify(payload);
+  let res;
+  try {
+    // attempt 1: key in the URL (simplest request for browsers)
+    res = await fetchWithBackoff(`${url}?key=${encodeURIComponent(key)}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body });
+  } catch (e) {
+    if (!(e instanceof TypeError)) throw e;
+    try {
+      // attempt 2: key in a header
+      res = await fetchWithBackoff(url, { method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key }, body });
+    } catch (e2) {
+      const err = new Error('NETWORK');
+      err.detail = e2?.message || e?.message || '';
+      throw err;
+    }
+  }
+  if (!res.ok) {
+    const e = await res.json().catch(() => ({}));
+    const msg = e.error?.message || `Request failed (${res.status})`;
+    throw new Error(/API key/i.test(msg) ? 'BAD_KEY' : msg);
+  }
+  return res.json();
+}
+
+function textFrom(result) {
+  const parts = result?.candidates?.[0]?.content?.parts || [];
+  const txt = parts.map((p) => p.text || '').join('').trim();
+  if (!txt) {
+    const reason = result?.promptFeedback?.blockReason;
+    throw new Error(reason ? `The request was blocked (${reason}). Try rephrasing.` : 'The AI returned an empty answer. Please try again.');
+  }
+  return txt;
+}
+
+async function askGemini({ messages, system, apiKey }) {
+  const payload = { contents: messages.map((m) => ({ role: m.role === 'model' ? 'model' : 'user', parts: [{ text: m.text }] })) };
+  if (system) payload.systemInstruction = { parts: [{ text: system }] };
+  return textFrom(await geminiCall(CONFIG.TEXT_MODEL, payload, apiKey));
+}
+
+async function askGeminiVision({ prompt, image, apiKey }) {
+  const payload = { contents: [{ role: 'user', parts: [{ text: prompt }, { inlineData: { mimeType: image.mime, data: image.base64 } }] }] };
+  return textFrom(await geminiCall(CONFIG.TEXT_MODEL, payload, apiKey));
+}
+
+async function generateImage({ prompt, aspect = '16:9', apiKey }) {
+  const payload = {
+    contents: [{ parts: [{ text: prompt }] }],
+    generationConfig: { responseModalities: ['TEXT', 'IMAGE'], imageConfig: { aspectRatio: aspect } },
+  };
+  const result = await geminiCall(CONFIG.IMAGE_MODEL, payload, apiKey);
+  const part = result?.candidates?.[0]?.content?.parts?.find((p) => p.inlineData);
+  if (!part) throw new Error('The AI did not return an image. Try a simpler description.');
+  return `data:${part.inlineData.mimeType};base64,${part.inlineData.data}`;
+}
+
+function friendlyError(e) {
+  if (e?.message === 'NO_KEY') return 'Add your Gemini API key (key button in the top bar) to use AI features.';
+  if (e?.message === 'BAD_KEY') return 'Your Gemini API key was rejected. Please check it in the key settings.';
+  if (e?.message === 'BAD_KEY_FORMAT') return 'Your API key contains invalid characters. Copy it again from Google AI Studio — it looks like AIzaSy… and has only English letters, numbers, - and _.';
+  if (e?.message === 'NETWORK' || e instanceof TypeError) {
+    return `The browser could not reach Google's AI server${e?.detail ? ` (${e.detail})` : ''}. Your internet may be fine — common causes: an ad-blocker/VPN/firewall blocking generativelanguage.googleapis.com, a network that blocks Google AI, or this page running inside a preview sandbox that blocks outside requests. Fix without a VPN: open "AI Key", set a Proxy URL (deploy gemini-proxy-worker.js on Cloudflare Workers, it is free), then press "Test key".`;
+  }
+  return e?.message || 'Something went wrong.';
+}
+
+// Validate + downscale an image file, return { dataUrl, mime, base64 }
+const readAsDataURL = (file) => new Promise((resolve, reject) => {
+  const r = new FileReader();
+  r.onload = () => resolve(r.result);
+  r.onerror = () => reject(new Error('read failed'));
+  r.readAsDataURL(file);
+});
+const loadImg = (src) => new Promise((resolve, reject) => {
+  const img = new Image();
+  img.onload = () => (img.width ? resolve(img) : reject(new Error('empty image')));
+  img.onerror = () => reject(new Error('decode failed'));
+  img.src = src;
+});
+
+async function prepareImage(file) {
+  const name = (file.name || '').toLowerCase();
+  const isHeic = /hei[cf]/.test(file.type || '') || /\.(heic|heif)$/.test(name);
+  const looksLikeImage = (file.type || '').startsWith('image/') || /\.(jpe?g|png|webp|gif|bmp|heic|heif)$/.test(name);
+  if (!looksLikeImage) throw new Error('Please choose an image file (JPG, PNG or WebP).');
+  if (file.size > 10 * 1024 * 1024) throw new Error('Image is larger than 10MB.');
+  if (file.size === 0) throw new Error('The selected file is empty.');
+
+  // 1) decode (createImageBitmap also respects phone-camera rotation), 2) fall back to <img>
+  let src = null;
+  try { src = await createImageBitmap(file, { imageOrientation: 'from-image' }); } catch {}
+  if (!src) { try { src = await loadImg(await readAsDataURL(file)); } catch {} }
+
+  if (!src) {
+    if (isHeic) throw new Error('This HEIC/HEIF photo cannot be opened by the browser. On iPhone choose Settings → Camera → Formats → Most Compatible, or share the photo as JPG, then try again.');
+    // last resort: send the original bytes if Gemini accepts the format
+    if (['image/jpeg', 'image/png', 'image/webp'].includes(file.type)) {
+      const dataUrl = await readAsDataURL(file);
+      return { dataUrl, mime: file.type, base64: String(dataUrl).split(',')[1] };
+    }
+    throw new Error('Could not read this image. Please try a JPG or PNG photo.');
+  }
+
+  const w = src.width, h = src.height;
+  const s = Math.min(1, 1280 / Math.max(w, h));
+  const c = document.createElement('canvas');
+  c.width = Math.max(1, Math.round(w * s));
+  c.height = Math.max(1, Math.round(h * s));
+  const ctx = c.getContext('2d');
+  ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, c.width, c.height); // flatten transparent PNGs
+  ctx.drawImage(src, 0, 0, c.width, c.height);
+  src.close?.();
+  const dataUrl = c.toDataURL('image/jpeg', 0.85);
+  return { dataUrl, mime: 'image/jpeg', base64: dataUrl.split(',')[1] };
+}
+
+const baseSystem = (lang) =>
+  `You are AutoMind AI, an expert automotive assistant. Reply in ${lang}. Use clear markdown: short headings, bullet lists, and tables when comparing. ` +
+  `Never invent specifications, part numbers or prices — give ranges and say when you are unsure. ` +
+  `For safety-critical issues (brakes, steering, airbags, fuel leaks, overheating) always recommend a professional inspection.`;
+
+/* =====================================================================
+   TRANSLATIONS (EN / UR / AR)
+   ===================================================================== */
+const translations = {
+  en: {
+    brand: 'AutoMind AI',
+    tagline: 'Your Intelligent Automotive Assistant',
+    nav: { home: 'Home', tools: 'AI Tools', scanner: 'Car Scanner', studio: 'Custom Studio', compare: 'Compare Cars', about: 'About Us', login: 'Login', logout: 'Logout', dashboard: 'Dashboard', pricing: 'Pricing', contact: 'Contact', aiKey: 'AI Key' },
+    hero: { title1: 'Your Car.', title2: 'Your AI Expert.', sub: "Discover Your Car's Potential with AI", explore: 'Explore AI Tools', demo: 'Watch Demo' },
+    home: {
+      toolsHeading: 'Our Powerful AI Tools', studioTitle: 'AI Customization Studio', studioSub: 'Transform Your Car with AI', tryNow: 'Try Now',
+      compareTitle: 'Compare Cars', compareSub: 'Find the Best Choice', compareNow: 'Compare Now',
+      chatTitle: 'AI Chat Assistant', chatSub: 'Ask Anything About Cars', chatHint: 'Ask me anything... (e.g. best car under $30k?)',
+      chatPlaceholder: 'Type your question...', chatWelcome: 'Hi! I\'m your AI car assistant. Ask me about buying, repairs, costs or maintenance.',
+    },
+    strip: { global: 'Global Support', globalSub: 'English, Urdu & Arabic', secure: 'Privacy First', secureSub: 'Garage data stays on your device', powered: 'Powered by AI', poweredSub: 'Smarter Answers', slogan: 'Drive Smarter. Live Better.' },
+    tools: {
+      doctor: ['AI Car Doctor', 'Find Issues & Get Solutions'],
+      scanner: ['AI Car Scanner', 'Identify Parts & Check Health'],
+      customizer: ['Customization Studio', 'Design Your Dream Car'],
+      estimator: ['Car Price Estimator', 'Estimate Market Value'],
+      comparison: ['Car Comparison', 'Compare Models'],
+      mechanic: ['AI Mechanic', 'Get Repair Guidance'],
+      buyingAdvisor: ['Buying Advisor', 'Find Your Perfect Car'],
+      mechanicFinder: ['Mechanic Finder', 'Find Shops Near You'],
+      partsFinder: ['Spare Parts Finder', 'Check Part Compatibility'],
+      fuelAdvisor: ['Fuel Advisor', 'Calculate Trip Costs'],
+      maintenance: ['Maintenance Manager', 'Track Service History'],
+      damageAnalyzer: ['Damage Analyzer', 'Assess Collision Damage'],
+      insurance: ['Insurance Advisor', 'Understand Your Coverage'],
+    },
+  },
+  ur: {
+    brand: 'آٹو مائنڈ AI',
+    tagline: 'آپ کا ذہین آٹوموٹیو اسسٹنٹ',
+    nav: { home: 'ہوم', tools: 'AI ٹولز', scanner: 'کار اسکینر', studio: 'کسٹم اسٹوڈیو', compare: 'گاڑیوں کا موازنہ', about: 'ہمارے بارے میں', login: 'لاگ ان', logout: 'لاگ آؤٹ', dashboard: 'ڈیش بورڈ', pricing: 'قیمتیں', contact: 'رابطہ', aiKey: 'AI کی' },
+    hero: { title1: 'آپ کی گاڑی۔', title2: 'آپ کا AI ماہر۔', sub: 'AI کے ساتھ اپنی گاڑی کی صلاحیت دریافت کریں', explore: 'AI ٹولز دیکھیں', demo: 'ڈیمو دیکھیں' },
+    home: {
+      toolsHeading: 'ہمارے طاقتور AI ٹولز', studioTitle: 'AI کسٹمائزیشن اسٹوڈیو', studioSub: 'AI سے اپنی گاڑی کا انداز بدلیں', tryNow: 'ابھی آزمائیں',
+      compareTitle: 'گاڑیوں کا موازنہ', compareSub: 'بہترین انتخاب تلاش کریں', compareNow: 'موازنہ کریں',
+      chatTitle: 'AI چیٹ اسسٹنٹ', chatSub: 'گاڑیوں کے بارے میں کچھ بھی پوچھیں', chatHint: 'کچھ بھی پوچھیں... (مثلاً 30 ہزار ڈالر تک بہترین گاڑی؟)',
+      chatPlaceholder: 'اپنا سوال لکھیں...', chatWelcome: 'سلام! میں آپ کا AI کار اسسٹنٹ ہوں۔ خریداری، مرمت، اخراجات یا مینٹیننس کے بارے میں پوچھیں۔',
+    },
+    strip: { global: 'عالمی سپورٹ', globalSub: 'انگریزی، اردو اور عربی', secure: 'پرائیویسی پہلے', secureSub: 'گیراج کا ڈیٹا آپ کے ڈیوائس پر رہتا ہے', powered: 'AI سے چلتا ہے', poweredSub: 'بہتر جوابات', slogan: 'سمجھداری سے چلائیں۔ بہتر جئیں۔' },
+    tools: {
+      doctor: ['AI کار ڈاکٹر', 'مسائل جانیں اور حل پائیں'],
+      scanner: ['AI کار اسکینر', 'پرزے پہچانیں اور حالت جانچیں'],
+      customizer: ['کسٹمائزیشن اسٹوڈیو', 'اپنی خوابوں کی گاڑی ڈیزائن کریں'],
+      estimator: ['قیمت کا اندازہ', 'مارکیٹ ویلیو کا اندازہ'],
+      comparison: ['گاڑیوں کا موازنہ', 'ماڈلز کا موازنہ'],
+      mechanic: ['AI مکینک', 'مرمت کی رہنمائی'],
+      buyingAdvisor: ['خریداری مشیر', 'اپنی بہترین گاڑی تلاش کریں'],
+      mechanicFinder: ['مکینک تلاش کریں', 'اپنے قریب ورکشاپ تلاش کریں'],
+      partsFinder: ['اسپیئر پارٹس', 'پرزوں کی مطابقت جانچیں'],
+      fuelAdvisor: ['فیول ایڈوائزر', 'سفر کا خرچ نکالیں'],
+      maintenance: ['مینٹیننس مینیجر', 'سروس ہسٹری محفوظ کریں'],
+      damageAnalyzer: ['نقصان کا تجزیہ', 'حادثے کے نقصان کا اندازہ'],
+      insurance: ['انشورنس ایڈوائزر', 'اپنی کوریج سمجھیں'],
+    },
+  },
+  ar: {
+    brand: 'أوتومايند AI',
+    tagline: 'مساعدك الذكي للسيارات',
+    nav: { home: 'الرئيسية', tools: 'أدوات AI', scanner: 'ماسح السيارة', studio: 'استوديو التعديل', compare: 'مقارنة السيارات', about: 'من نحن', login: 'دخول', logout: 'خروج', dashboard: 'لوحة التحكم', pricing: 'الأسعار', contact: 'اتصل بنا', aiKey: 'مفتاح AI' },
+    hero: { title1: 'سيارتك.', title2: 'خبيرك بالذكاء الاصطناعي.', sub: 'اكتشف إمكانات سيارتك مع الذكاء الاصطناعي', explore: 'استكشف الأدوات', demo: 'شاهد العرض' },
+    home: {
+      toolsHeading: 'أدواتنا القوية بالذكاء الاصطناعي', studioTitle: 'استوديو التعديل الذكي', studioSub: 'حوّل سيارتك بالذكاء الاصطناعي', tryNow: 'جرّب الآن',
+      compareTitle: 'مقارنة السيارات', compareSub: 'اعثر على الخيار الأفضل', compareNow: 'قارن الآن',
+      chatTitle: 'مساعد الدردشة الذكي', chatSub: 'اسأل أي شيء عن السيارات', chatHint: 'اسألني أي شيء... (مثلاً أفضل سيارة بأقل من 30 ألف دولار؟)',
+      chatPlaceholder: 'اكتب سؤالك...', chatWelcome: 'مرحباً! أنا مساعدك الذكي للسيارات. اسألني عن الشراء أو الإصلاح أو التكاليف أو الصيانة.',
+    },
+    strip: { global: 'دعم عالمي', globalSub: 'الإنجليزية والأردية والعربية', secure: 'الخصوصية أولاً', secureSub: 'بيانات الكراج تبقى على جهازك', powered: 'مدعوم بالذكاء الاصطناعي', poweredSub: 'إجابات أذكى', slogan: 'قُد بذكاء. عِش أفضل.' },
+    tools: {
+      doctor: ['طبيب السيارة الذكي', 'اكتشف الأعطال واحصل على الحلول'],
+      scanner: ['ماسح السيارة الذكي', 'تعرّف على القطع وافحص الحالة'],
+      customizer: ['استوديو التعديل', 'صمّم سيارة أحلامك'],
+      estimator: ['مقدّر السعر', 'قدّر القيمة السوقية'],
+      comparison: ['مقارنة السيارات', 'قارن بين الطرازات'],
+      mechanic: ['الميكانيكي الذكي', 'إرشادات الإصلاح'],
+      buyingAdvisor: ['مستشار الشراء', 'اعثر على سيارتك المثالية'],
+      mechanicFinder: ['البحث عن ميكانيكي', 'اعثر على ورش قريبة'],
+      partsFinder: ['قطع الغيار', 'تحقق من توافق القطع'],
+      fuelAdvisor: ['مستشار الوقود', 'احسب تكلفة الرحلة'],
+      maintenance: ['مدير الصيانة', 'تتبّع سجل الخدمة'],
+      damageAnalyzer: ['محلل الأضرار', 'قيّم أضرار الحوادث'],
+      insurance: ['مستشار التأمين', 'افهم تغطيتك'],
+    },
+  },
+};
+
+function buildT(lang) {
+  const en = translations.en;
+  const l = translations[lang] || en;
+  const out = { ...en, ...l };
+  ['nav', 'hero', 'home', 'strip', 'tools'].forEach((k) => { out[k] = { ...en[k], ...(l[k] || {}) }; });
+  return out;
+}
+
+const TOOLS = [
+  { id: 'doctor', icon: Stethoscope, color: 'text-sky-400' },
+  { id: 'scanner', icon: Camera, color: 'text-sky-400' },
+  { id: 'customizer', icon: Palette, color: 'text-sky-400' },
+  { id: 'estimator', icon: Tag, color: 'text-sky-400' },
+  { id: 'comparison', icon: Scale, color: 'text-sky-400' },
+  { id: 'mechanic', icon: Wrench, color: 'text-sky-400' },
+  { id: 'buyingAdvisor', icon: Compass, color: 'text-sky-400' },
+  { id: 'mechanicFinder', icon: MapPin, color: 'text-sky-400' },
+  { id: 'partsFinder', icon: Cog, color: 'text-sky-400' },
+  { id: 'fuelAdvisor', icon: Fuel, color: 'text-sky-400' },
+  { id: 'maintenance', icon: Calendar, color: 'text-sky-400' },
+  { id: 'damageAnalyzer', icon: ShieldAlert, color: 'text-sky-400' },
+  { id: 'insurance', icon: ShieldCheck, color: 'text-sky-400' },
+];
+const HOME_TOOLS = ['doctor', 'scanner', 'customizer', 'estimator', 'comparison', 'mechanic'];
+
+/* =====================================================================
+   SMALL SHARED PIECES
+   ===================================================================== */
+const AppCtx = createContext(null);
+const useApp = () => useContext(AppCtx);
+
+// Global theme: guarantees visible typed text and a full-page navy background in every browser
+const GLOBAL_CSS = `
+  html, body, #root { min-height: 100%; margin: 0; background-color: #040a1c; color: #eaf2ff; color-scheme: dark; }
+  body {
+    background-image:
+      radial-gradient(ellipse 70% 40% at 50% 0%, rgba(37,99,235,.35) 0%, transparent 70%),
+      radial-gradient(ellipse 50% 35% at 100% 40%, rgba(14,165,233,.14) 0%, transparent 70%),
+      radial-gradient(ellipse 50% 35% at 0% 75%, rgba(37,99,235,.16) 0%, transparent 70%);
+    background-attachment: fixed;
+  }
+  input, textarea, select {
+    color: #ffffff !important;
+    -webkit-text-fill-color: #ffffff !important;
+    caret-color: #38bdf8 !important;
+    background-color: #050b1f;
+    opacity: 1;
+  }
+  input::placeholder, textarea::placeholder { color: #5c78b0 !important; -webkit-text-fill-color: #5c78b0 !important; opacity: 1; }
+  input[type="checkbox"] { -webkit-text-fill-color: initial !important; }
+  input:-webkit-autofill { -webkit-box-shadow: 0 0 0 1000px #050b1f inset !important; -webkit-text-fill-color: #fff !important; }
+  option { background-color: #0a1a3f !important; color: #ffffff !important; }
+  input[type="date"]::-webkit-calendar-picker-indicator { filter: invert(1); }
+  ::-webkit-scrollbar { width: 10px; height: 10px; }
+  ::-webkit-scrollbar-track { background: #050b1f; }
+  ::-webkit-scrollbar-thumb { background: #1f3d7a; border-radius: 8px; }
+`;
+
+const UI = {
+  input: 'w-full bg-[#050b1f] border border-[#17306a] rounded-xl px-3 py-2.5 text-sm text-white placeholder-[#5c78b0] outline-none focus:border-sky-400 focus:ring-2 focus:ring-sky-500/30 transition-colors',
+  card: 'rounded-2xl bg-gradient-to-b from-[#0d1c45]/90 to-[#081230]/90 border border-[#1b3a7e] shadow-[0_0_28px_rgba(37,99,235,.14)]',
+  primary: 'px-5 py-2.5 rounded-xl bg-gradient-to-r from-sky-400 to-blue-600 text-[#03081a] font-bold text-sm hover:brightness-110 disabled:opacity-50 disabled:cursor-not-allowed inline-flex items-center justify-center gap-2 transition',
+  ghost: 'px-5 py-2.5 rounded-xl bg-[#0b1633] border border-[#1f3d7a] text-white font-semibold text-sm hover:border-sky-400 inline-flex items-center justify-center gap-2 transition',
+  label: 'block text-xs font-semibold text-[#9db4d9] mb-1.5',
+};
+
+function useLocalStorage(key, initial) {
+  const [v, setV] = useState(() => {
+    try { const s = localStorage.getItem(key); return s ? JSON.parse(s) : initial; } catch { return initial; }
+  });
+  useEffect(() => { try { localStorage.setItem(key, JSON.stringify(v)); } catch {} }, [key, v]);
+  return [v, setV];
+}
+
+const monthKey = () => new Date().toISOString().slice(0, 7);
+const todayStr = () => new Date().toISOString().slice(0, 10);
+
+async function sha256(s) {
+  try {
+    const b = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(s));
+    return Array.from(new Uint8Array(b)).map((x) => x.toString(16).padStart(2, '0')).join('');
+  } catch { return btoa(unescape(encodeURIComponent(s))); }
+}
+
+// --- tiny safe markdown renderer (no innerHTML) ---
+function inline(s) {
+  return s.split(/(\*\*[^*]+\*\*|`[^`]+`)/g).map((p, i) => {
+    if (p.length > 4 && p.startsWith('**') && p.endsWith('**')) return <strong key={i} className="text-white font-semibold">{p.slice(2, -2)}</strong>;
+    if (p.length > 2 && p.startsWith('`') && p.endsWith('`')) return <code key={i} className="px-1 py-0.5 rounded bg-[#050b1f] text-sky-300 text-[0.85em]">{p.slice(1, -1)}</code>;
+    return p;
+  });
+}
+
+function Rich({ text }) {
+  const lines = String(text || '').split('\n');
+  const out = [];
+  let i = 0;
+  while (i < lines.length) {
+    const l = lines[i];
+    if (/^\s*\|/.test(l)) {
+      const rows = [];
+      while (i < lines.length && /^\s*\|/.test(lines[i])) { rows.push(lines[i]); i++; }
+      const cells = (r) => r.trim().replace(/^\||\|$/g, '').split('|').map((c) => c.trim());
+      const body = rows.filter((r) => !(/^\s*\|?[\s:|-]+\|?\s*$/.test(r) && r.includes('-')));
+      if (body.length) {
+        const head = cells(body[0]);
+        out.push(
+          <div key={`t${i}`} className="overflow-x-auto my-3">
+            <table className="w-full text-sm border-collapse">
+              <thead><tr>{head.map((c, k) => <th key={k} className="text-start p-2 border border-[#17306a] bg-[#0f2150] text-sky-300">{inline(c)}</th>)}</tr></thead>
+              <tbody>{body.slice(1).map((r, a) => <tr key={a}>{cells(r).map((c, k) => <td key={k} className="p-2 border border-[#17306a]">{inline(c)}</td>)}</tr>)}</tbody>
+            </table>
+          </div>
+        );
+      }
+      continue;
+    }
+    if (/^#{1,4}\s/.test(l)) out.push(<h4 key={i} className="text-white font-bold text-base mt-4 mb-1">{inline(l.replace(/^#{1,4}\s+/, ''))}</h4>);
+    else if (/^\s*[-*•]\s+/.test(l)) out.push(<div key={i} className="flex gap-2 ps-1"><span className="text-sky-400">•</span><span>{inline(l.replace(/^\s*[-*•]\s+/, ''))}</span></div>);
+    else if (/^\s*\d+[.)]\s+/.test(l)) { const m = l.match(/^\s*(\d+)[.)]\s+(.*)$/); out.push(<div key={i} className="flex gap-2 ps-1"><span className="text-sky-400 font-semibold">{m[1]}.</span><span>{inline(m[2])}</span></div>); }
+    else if (!l.trim()) out.push(<div key={i} className="h-2" />);
+    else out.push(<p key={i}>{inline(l)}</p>);
+    i++;
+  }
+  return <div className="text-sm text-[#d6e3f8] leading-relaxed space-y-1">{out}</div>;
+}
+
+function ResultBox({ text, error }) {
+  const { notify } = useApp();
+  if (!text && !error) return null;
+  if (error) {
+    return <div className="mt-6 p-4 rounded-2xl bg-rose-950/50 border border-rose-700/60 text-sm text-rose-200 flex gap-2"><AlertTriangle className="w-4 h-4 mt-0.5 shrink-0" />{error}</div>;
+  }
+  return (
+    <div className={`mt-6 p-5 ${UI.card} border-sky-500/40`}>
+      <div className="flex justify-end mb-1">
+        <button onClick={() => { navigator.clipboard?.writeText(text).then(() => notify('Copied to clipboard')); }} className="text-xs text-[#9db4d9] hover:text-sky-300 flex items-center gap-1"><Copy className="w-3.5 h-3.5" /> Copy</button>
+      </div>
+      <Rich text={text} />
+    </div>
+  );
+}
+
+function KeyBanner() {
+  const { hasKey, openKey } = useApp();
+  if (hasKey) return null;
+  return (
+    <div className="p-3 rounded-xl bg-amber-950/40 border border-amber-700/50 text-sm text-amber-200 flex flex-wrap items-center justify-between gap-2">
+      <span className="flex items-center gap-2"><Key className="w-4 h-4" /> AI features need a free Gemini API key.</span>
+      <button onClick={openKey} className="px-3 py-1 rounded-lg bg-amber-400 text-black font-bold text-xs">Add API key</button>
+    </div>
+  );
+}
+
+function Page({ icon: Icon, title, subtitle, children, width = 'max-w-4xl', needsKey = true }) {
+  return (
+    <div className={`${width} mx-auto px-4 py-10 space-y-6`}>
+      <div className="text-center space-y-2">
+        <h1 className="text-3xl font-extrabold text-white flex items-center justify-center gap-3">
+          {Icon && <Icon className="w-8 h-8 text-sky-400" />} {title}
+        </h1>
+        {subtitle && <p className="text-[#9db4d9] text-sm max-w-2xl mx-auto">{subtitle}</p>}
+      </div>
+      {needsKey && <KeyBanner />}
+      {children}
+    </div>
+  );
+}
+
+function Field({ f, value, onChange }) {
+  return (
+    <div className={f.wide ? 'sm:col-span-2' : ''}>
+      <label className={UI.label}>{f.label}</label>
+      {f.options ? (
+        <select value={value} onChange={(e) => onChange(e.target.value)} className={UI.input}>{f.options.map((o) => <option key={o}>{o}</option>)}</select>
+      ) : (
+        <input type={f.type || 'text'} value={value} onChange={(e) => onChange(e.target.value)} placeholder={f.placeholder} className={UI.input} required={f.required} />
+      )}
+    </div>
+  );
+}
+
+/* =====================================================================
+   ART: logo, hero car, skyline
+   ===================================================================== */
+function Logo({ className = 'w-12 h-8' }) {
+  return (
+    <svg viewBox="0 0 120 50" className={className} fill="none" aria-hidden="true">
+      <defs><linearGradient id="lg" x1="0" x2="1"><stop offset="0" stopColor="#38bdf8" /><stop offset="1" stopColor="#2563eb" /></linearGradient></defs>
+      <path d="M6 34 C10 26 22 22 34 20 C44 10 62 7 76 12 C90 14 100 22 112 28 C116 30 116 34 110 34" stroke="url(#lg)" strokeWidth="3.5" strokeLinecap="round" />
+      <path d="M12 38 C30 34 80 34 108 38" stroke="url(#lg)" strokeWidth="2" strokeLinecap="round" opacity=".6" />
+      <circle cx="34" cy="36" r="6" stroke="url(#lg)" strokeWidth="3" /><circle cx="90" cy="36" r="6" stroke="url(#lg)" strokeWidth="3" />
+    </svg>
+  );
+}
+
+function CarArt({ color = '#1d4ed8', accent = '#38bdf8', className = '' }) {
+  const uid = React.useId().replace(/:/g, '');
+  const body = 'M60 262 L60 232 Q62 210 105 202 L262 184 Q310 128 392 116 L528 114 Q588 116 628 160 L706 186 Q748 196 752 230 L752 262 Z';
+  return (
+    <svg viewBox="0 0 800 330" className={className} role="img" aria-label="Car illustration">
+      <defs>
+        <linearGradient id={`sh${uid}`} x1="0" y1="0" x2="0" y2="1"><stop offset=".35" stopColor="#000" stopOpacity="0" /><stop offset="1" stopColor="#000" stopOpacity=".55" /></linearGradient>
+        <linearGradient id={`gl${uid}`} x1="0" y1="0" x2="1" y2="1"><stop offset="0" stopColor="#0b1a3a" /><stop offset="1" stopColor="#1e3a8a" /></linearGradient>
+        <radialGradient id={`rm${uid}`}><stop offset="0" stopColor="#e5e7eb" /><stop offset="1" stopColor="#6b7280" /></radialGradient>
+        <filter id={`bl${uid}`}><feGaussianBlur stdDeviation="10" /></filter>
+      </defs>
+      <ellipse cx="410" cy="300" rx="360" ry="16" fill={accent} opacity=".45" filter={`url(#bl${uid})`} />
+      <path d={body} fill={color} />
+      <path d={body} fill={`url(#sh${uid})`} />
+      <path d="M100 214 Q400 192 742 212" stroke="#fff" strokeOpacity=".35" strokeWidth="2.5" fill="none" />
+      <path d="M296 182 Q332 140 392 130 L520 128 Q560 132 590 166 Z" fill={`url(#gl${uid})`} />
+      <path d="M452 129 L452 178" stroke="#020617" strokeWidth="4" />
+      <path d="M306 176 Q338 148 392 140" stroke="#fff" strokeOpacity=".25" strokeWidth="3" fill="none" />
+      <path d="M718 214 L752 224 L752 248 L714 244 Z" fill="#020617" />
+      <path d="M686 192 L744 202 L738 216 L682 208 Z" fill="#e0f7ff" /><path d="M686 192 L744 202 L738 216 L682 208 Z" fill="#7dd3fc" opacity=".6" filter={`url(#bl${uid})`} />
+      <rect x="62" y="214" width="26" height="9" rx="3" fill="#ef4444" />
+      {[205, 598].map((cx) => (
+        <g key={cx}>
+          <circle cx={cx} cy="262" r="60" fill="#050b1f" />
+          <circle cx={cx} cy="262" r="50" fill="#05070f" />
+          <circle cx={cx} cy="262" r="38" fill={`url(#rm${uid})`} />
+          {[0, 72, 144, 216, 288].map((a) => <line key={a} x1={cx} y1="262" x2={cx + 36 * Math.cos((a * Math.PI) / 180)} y2={262 + 36 * Math.sin((a * Math.PI) / 180)} stroke="#111827" strokeWidth="9" strokeLinecap="round" />)}
+          <circle cx={cx} cy="262" r="9" fill="#111827" />
+        </g>
+      ))}
+    </svg>
+  );
+}
+
+const SKY = Array.from({ length: 26 }, (_, i) => ({ x: i * 34, w: 26 + ((i * 7) % 3) * 6, h: 70 + ((i * 53) % 9) * 16 }));
+function Skyline({ className = '' }) {
+  return (
+    <svg viewBox="0 0 884 260" preserveAspectRatio="xMidYMax slice" className={className} aria-hidden="true">
+      {SKY.map((b, i) => (
+        <g key={i}>
+          <rect x={b.x} y={260 - b.h} width={b.w} height={b.h} fill="#0a1740" />
+          {Array.from({ length: Math.floor(b.h / 18) }).map((_, r) => (r * 3 + i) % 3 !== 0 && <rect key={r} x={b.x + 5} y={260 - b.h + 8 + r * 18} width="4" height="6" fill="#7dd3fc" opacity=".7" />)}
+          {Array.from({ length: Math.floor(b.h / 18) }).map((_, r) => (r * 5 + i) % 4 === 0 && <rect key={`b${r}`} x={b.x + b.w - 10} y={260 - b.h + 8 + r * 18} width="4" height="6" fill="#fbbf24" opacity=".6" />)}
+        </g>
+      ))}
+    </svg>
+  );
+}
+
+/* =====================================================================
+   CHAT HOOK + CHAT BOX
+   ===================================================================== */
+function useChat(getSystem, welcome) {
+  const { apiKey } = useApp();
+  const [messages, setMessages] = useState([{ role: 'model', text: welcome, local: true }]);
+  const [loading, setLoading] = useState(false);
+
+  const send = async (text) => {
+    const clean = text.trim();
+    if (!clean || loading) return;
+    const next = [...messages, { role: 'user', text: clean }];
+    setMessages(next);
+    setLoading(true);
+    try {
+      const history = next.filter((m) => !m.local && !m.error).slice(-14).map((m) => ({ role: m.role, text: m.text }));
+      const reply = await askGemini({ messages: history, system: getSystem(), apiKey });
+      setMessages((p) => [...p, { role: 'model', text: reply }]);
+    } catch (e) {
+      setMessages((p) => [...p, { role: 'model', text: friendlyError(e), error: true }]);
+    } finally { setLoading(false); }
+  };
+  const reset = () => setMessages([{ role: 'model', text: welcome, local: true }]);
+  return { messages, loading, send, reset };
+}
+
+function ChatBox({ chat, placeholder, height = 'h-[380px]', chips = [], compact = false }) {
+  const [val, setVal] = useState('');
+  const box = useRef(null);
+  useEffect(() => { if (box.current) box.current.scrollTop = box.current.scrollHeight; }, [chat.messages, chat.loading]);
+  const submit = (e) => { e.preventDefault(); if (chat.loading || !val.trim()) return; chat.send(val); setVal(''); };
+  return (
+    <div className="flex flex-col h-full min-h-0">
+      <div ref={box} className={`${height} overflow-y-auto space-y-3 pe-1`}>
+        {chat.messages.map((m, i) => (
+          <div key={i} className={`flex ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+            <div className={`max-w-[92%] px-3.5 py-2.5 rounded-2xl text-sm ${m.role === 'user' ? 'bg-sky-500 text-[#03081a] font-medium' : m.error ? 'bg-rose-950/60 border border-rose-700/60 text-rose-200' : 'bg-[#050b1f] border border-[#17306a] text-[#dbe6f7]'}`}>
+              {m.role === 'user' || m.error ? m.text : <Rich text={m.text} />}
+            </div>
+          </div>
+        ))}
+        {chat.loading && <div className="flex"><div className="px-3.5 py-2.5 rounded-2xl bg-[#050b1f] border border-[#17306a] text-sky-400 text-sm flex items-center gap-2"><Loader2 className="w-4 h-4 animate-spin" /> Thinking…</div></div>}
+      </div>
+      {chips.length > 0 && !compact && (
+        <div className="flex flex-wrap gap-2 pt-3">{chips.map((c) => <button key={c} onClick={() => chat.send(c)} disabled={chat.loading} className="px-3 py-1 rounded-full bg-[#0f2150] border border-[#1f3d7a] text-xs text-sky-200 hover:border-sky-400 disabled:opacity-50">{c}</button>)}</div>
+      )}
+      <form onSubmit={submit} className="flex gap-2 pt-3">
+        <input value={val} onChange={(e) => setVal(e.target.value)} placeholder={placeholder} autoComplete="off" className={UI.input} />
+        <button type="submit" disabled={chat.loading || !val.trim()} aria-label="Send" className="w-11 shrink-0 rounded-xl bg-sky-500 text-[#03081a] flex items-center justify-center hover:bg-sky-400 disabled:opacity-50"><Send className="w-4 h-4 rtl:-scale-x-100" /></button>
+      </form>
+    </div>
+  );
+}
+
+/* =====================================================================
+   APP ROOT
+   ===================================================================== */
+export default function App() {
+  const [lang, setLang] = useLocalStorage('automind_lang', 'en');
+  const [view, setView] = useState('home');
+  const [mobileOpen, setMobileOpen] = useState(false);
+  const [toolsOpen, setToolsOpen] = useState(false);
+  const [keyModal, setKeyModal] = useState(false);
+  const [demoOpen, setDemoOpen] = useState(false);
+  const [payPlan, setPayPlan] = useState(null);
+  const [toast, setToast] = useState('');
+  const [prefill, setPrefill] = useState({});
+  const toolsRef = useRef(null);
+
+  const [apiKey, setApiKey] = useLocalStorage('automind_api_key', '');
+  const [proxy, setProxy] = useLocalStorage('automind_proxy', '');
+  PROXY_URL = /^https:\/\//i.test(proxy || '') ? proxy.trim() : '';
+  const [users, setUsers] = useLocalStorage('automind_users', {});
+  const [session, setSession] = useLocalStorage('automind_session', null);
+  const [guest, setGuest] = useLocalStorage('automind_guest', { subscription: 'Free', scansUsed: 0, scanMonth: monthKey() });
+  const [garage, setGarage] = useLocalStorage('automind_garage_v2', []);
+  const [logs, setLogs] = useLocalStorage('automind_logs_v2', []);
+
+  const t = buildT(lang);
+  const isRTL = lang === 'ur' || lang === 'ar';
+  const langName = LANG_NAMES[lang] || 'English';
+  const hasKey = !!(apiKey || CONFIG.DEFAULT_API_KEY);
+
+  useEffect(() => { if (!toast) return; const id = setTimeout(() => setToast(''), 3200); return () => clearTimeout(id); }, [toast]);
+  useEffect(() => {
+    const close = (e) => { if (toolsRef.current && !toolsRef.current.contains(e.target)) setToolsOpen(false); };
+    const esc = (e) => { if (e.key === 'Escape') { setToolsOpen(false); setKeyModal(false); setDemoOpen(false); setPayPlan(null); } };
+    document.addEventListener('mousedown', close);
+    document.addEventListener('keydown', esc);
+    return () => { document.removeEventListener('mousedown', close); document.removeEventListener('keydown', esc); };
+  }, []);
+
+  // --- profile (guest or registered, stored only in this browser) ---
+  const base = session && users[session] ? { ...users[session], email: session, loggedIn: true } : { ...guest, name: 'Guest', email: '', loggedIn: false };
+  const plan = PLANS[base.subscription] || PLANS.Free;
+  const profile = { ...base, subscription: PLANS[base.subscription] ? base.subscription : 'Free', scansUsed: base.scanMonth === monthKey() ? base.scansUsed : 0, maxScans: plan.scans, maxCars: plan.cars };
+  const patchProfile = (patch) => (session && users[session] ? setUsers((u) => ({ ...u, [session]: { ...u[session], ...patch } })) : setGuest((g) => ({ ...g, ...patch })));
+
+  const notify = (m) => setToast(m);
+  const navigate = (id, pre) => {
+    if (pre) setPrefill((p) => ({ ...p, [id]: pre }));
+    setView(id); setMobileOpen(false); setToolsOpen(false);
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  };
+  const checkScan = () => {
+    if (profile.scansUsed >= profile.maxScans) { notify(`Free plan limit reached (${profile.maxScans} scans/month). Upgrade for unlimited scans.`); navigate('pricing'); return false; }
+    return true;
+  };
+  const recordScan = () => patchProfile({ scansUsed: profile.scansUsed + 1, scanMonth: monthKey() });
+
+  const register = async (name, email, password) => {
+    const em = email.trim().toLowerCase();
+    if (!name.trim()) return 'Please enter your name.';
+    if (!/^\S+@\S+\.\S+$/.test(em)) return 'Please enter a valid email address.';
+    if (password.length < 6) return 'Password must be at least 6 characters.';
+    if (users[em]) return 'An account with this email already exists. Please sign in.';
+    const hash = await sha256(`${em}:${password}`);
+    setUsers((u) => ({ ...u, [em]: { name: name.trim(), hash, subscription: guest.subscription || 'Free', scansUsed: 0, scanMonth: monthKey() } }));
+    setSession(em);
+    return '';
+  };
+  const login = async (email, password) => {
+    const em = email.trim().toLowerCase();
+    const u = users[em];
+    if (!u) return 'No account found for this email.';
+    if (u.hash !== (await sha256(`${em}:${password}`))) return 'Incorrect password.';
+    setSession(em);
+    return '';
+  };
+  const logout = () => { setSession(null); notify('Signed out'); navigate('home'); };
+
+  const choosePlan = (name) => {
+    if (name === 'Free') { patchProfile({ subscription: 'Free' }); notify('Switched to the Free plan.'); }
+    else setPayPlan(name);
+  };
+  const activatePlan = (name) => { patchProfile({ subscription: name }); setPayPlan(null); notify(`${name} plan activated.`); };
+
+  const ctx = { t, lang, langName, isRTL, apiKey, hasKey, openKey: () => setKeyModal(true), navigate, notify, prefill, profile, checkScan, recordScan, garage, setGarage, logs, setLogs, choosePlan, register, login, logout };
+
+  return (
+    <AppCtx.Provider value={ctx}>
+      <div dir={isRTL ? 'rtl' : 'ltr'} className="min-h-screen w-full flex flex-col text-[#eaf2ff] font-sans selection:bg-sky-500 selection:text-black">
+        <style>{GLOBAL_CSS}</style>
+        {/* ---------- HEADER ---------- */}
+        <header className="sticky top-0 z-50 bg-[#050d24]/90 backdrop-blur-md border-b border-[#14295c]">
+          <div className="max-w-7xl mx-auto px-4 h-[72px] flex items-center justify-between gap-4">
+            <button onClick={() => navigate('home')} className="flex items-center gap-3 text-start">
+              <Logo />
+              <span className="flex flex-col leading-tight">
+                <span className="font-extrabold text-xl text-white tracking-tight">{lang === 'en' ? <>AutoMind <span className="text-sky-400">AI</span></> : t.brand}</span>
+                <span className="text-[10px] text-[#9db4d9] hidden sm:block">{t.tagline}</span>
+              </span>
+            </button>
+
+            <nav className="hidden lg:flex items-center gap-1 text-sm font-medium text-[#c3d3ee]">
+              <NavBtn active={view === 'home'} onClick={() => navigate('home')} icon={HomeIcon}>{t.nav.home}</NavBtn>
+              <div className="relative" ref={toolsRef}>
+                <NavBtn active={TOOLS.some((x) => x.id === view) && !['scanner', 'customizer', 'comparison'].includes(view)} onClick={() => setToolsOpen((o) => !o)} icon={Wrench} aria-expanded={toolsOpen}>
+                  {t.nav.tools} <ChevronDown className={`w-3.5 h-3.5 transition-transform ${toolsOpen ? 'rotate-180' : ''}`} />
+                </NavBtn>
+                {toolsOpen && (
+                  <div className="absolute start-0 top-full mt-2 w-[620px] p-3 grid grid-cols-2 gap-1 rounded-2xl bg-[#081433] border border-[#1f3d7a] shadow-2xl shadow-black/60">
+                    {TOOLS.map((tool) => (
+                      <button key={tool.id} onClick={() => navigate(tool.id)} className="flex items-center gap-3 p-2.5 rounded-xl hover:bg-[#12275a] text-start">
+                        <tool.icon className="w-5 h-5 text-sky-400 shrink-0" />
+                        <span><span className="block text-white text-sm font-semibold">{t.tools[tool.id][0]}</span><span className="block text-[11px] text-[#9db4d9]">{t.tools[tool.id][1]}</span></span>
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+              <NavBtn active={view === 'scanner'} onClick={() => navigate('scanner')} icon={Camera}>{t.nav.scanner}</NavBtn>
+              <NavBtn active={view === 'customizer'} onClick={() => navigate('customizer')} icon={Palette}>{t.nav.studio}</NavBtn>
+              <NavBtn active={view === 'comparison'} onClick={() => navigate('comparison')} icon={Scale}>{t.nav.compare}</NavBtn>
+              <NavBtn active={view === 'pricing'} onClick={() => navigate('pricing')} icon={Tag}>{t.nav.pricing}</NavBtn>
+              <NavBtn active={view === 'about'} onClick={() => navigate('about')} icon={Info}>{t.nav.about}</NavBtn>
+            </nav>
+
+            <div className="hidden lg:flex items-center gap-2">
+              <button onClick={() => setKeyModal(true)} title="Gemini API key" className={`px-3 py-2 rounded-xl border text-xs font-semibold flex items-center gap-1.5 ${hasKey ? 'border-emerald-700 text-emerald-300 bg-emerald-950/40' : 'border-amber-600 text-amber-300 bg-amber-950/30'}`}><Key className="w-3.5 h-3.5" />{t.nav.aiKey}</button>
+              <div className="flex items-center gap-1.5 px-2 py-1.5 rounded-xl border border-[#1f3d7a] bg-[#0b1633]">
+                <Globe className="w-4 h-4 text-sky-400" />
+                <select value={lang} onChange={(e) => setLang(e.target.value)} className="bg-transparent text-xs text-white outline-none cursor-pointer" aria-label="Language">
+                  <option value="en" className="text-black">EN</option><option value="ur" className="text-black">اردو</option><option value="ar" className="text-black">العربية</option>
+                </select>
+              </div>
+              {profile.loggedIn ? (
+                <>
+                  <button onClick={() => navigate('dashboard')} className={UI.ghost + ' !py-2 text-xs'}><LayoutDashboard className="w-4 h-4 text-sky-400" />{t.nav.dashboard}</button>
+                  <button onClick={logout} className={UI.ghost + ' !py-2 text-xs'} aria-label={t.nav.logout}><LogOut className="w-4 h-4" /></button>
+                </>
+              ) : (
+                <button onClick={() => navigate('login')} className="px-5 py-2 rounded-full bg-gradient-to-r from-sky-500 to-blue-600 text-white font-bold text-sm flex items-center gap-2 shadow-lg shadow-blue-600/30 hover:brightness-110"><User className="w-4 h-4" />{t.nav.login}</button>
+              )}
+            </div>
+
+            <button onClick={() => setMobileOpen((o) => !o)} className="lg:hidden p-2 rounded-lg hover:bg-[#14295c]" aria-label="Menu">{mobileOpen ? <X className="w-6 h-6 text-sky-400" /> : <Menu className="w-6 h-6" />}</button>
+          </div>
+
+          {mobileOpen && (
+            <div className="lg:hidden border-t border-[#14295c] bg-[#081433] px-4 py-4 space-y-3 max-h-[80vh] overflow-y-auto">
+              <div className="grid grid-cols-2 gap-1">
+                <MobBtn onClick={() => navigate('home')}>{t.nav.home}</MobBtn>
+                <MobBtn onClick={() => navigate('pricing')}>{t.nav.pricing}</MobBtn>
+                <MobBtn onClick={() => navigate('about')}>{t.nav.about}</MobBtn>
+                <MobBtn onClick={() => navigate('contact')}>{t.nav.contact}</MobBtn>
+                {TOOLS.map((tool) => <MobBtn key={tool.id} onClick={() => navigate(tool.id)}><tool.icon className="w-4 h-4 text-sky-400 shrink-0" /> {t.tools[tool.id][0]}</MobBtn>)}
+              </div>
+              <div className="flex gap-2 items-center">
+                <select value={lang} onChange={(e) => setLang(e.target.value)} className={UI.input + ' !w-auto'}><option value="en">English</option><option value="ur">اردو</option><option value="ar">العربية</option></select>
+                <button onClick={() => { setKeyModal(true); setMobileOpen(false); }} className={UI.ghost + ' flex-1'}><Key className="w-4 h-4" />{t.nav.aiKey}</button>
+              </div>
+              {profile.loggedIn ? (
+                <div className="flex gap-2"><button onClick={() => navigate('dashboard')} className={UI.primary + ' flex-1'}>{t.nav.dashboard}</button><button onClick={() => { logout(); setMobileOpen(false); }} className={UI.ghost}>{t.nav.logout}</button></div>
+              ) : <button onClick={() => navigate('login')} className={UI.primary + ' w-full'}>{t.nav.login}</button>}
+            </div>
+          )}
+        </header>
+
+        {/* ---------- VIEWS ---------- */}
+        <main className="flex-1">
+          {view === 'home' && <HomeView openDemo={() => setDemoOpen(true)} />}
+          {view === 'about' && <AboutView />}
+          {view === 'doctor' && <DoctorView />}
+          {view === 'scanner' && <ScannerView />}
+          {view === 'customizer' && <CustomizerView />}
+          {view === 'estimator' && <EstimatorView />}
+          {view === 'comparison' && <ComparisonView />}
+          {view === 'mechanic' && <RepairGuideView />}
+          {view === 'buyingAdvisor' && <BuyingAdvisorView />}
+          {view === 'mechanicFinder' && <MechanicFinderView />}
+          {view === 'partsFinder' && <PartsFinderView />}
+          {view === 'fuelAdvisor' && <FuelAdvisorView />}
+          {view === 'maintenance' && <MaintenanceView />}
+          {view === 'damageAnalyzer' && <DamageView />}
+          {view === 'insurance' && <InsuranceView />}
+          {view === 'contact' && <ContactView />}
+          {view === 'login' && <LoginView />}
+          {view === 'dashboard' && <DashboardView />}
+          {view === 'pricing' && <PricingView />}
+        </main>
+
+        <Footer />
+
+        {/* ---------- MODALS / TOAST ---------- */}
+        {keyModal && <KeyModal apiKey={apiKey} setApiKey={setApiKey} proxy={proxy} setProxy={setProxy} onClose={() => setKeyModal(false)} notify={notify} />}
+        {demoOpen && <DemoModal onClose={() => setDemoOpen(false)} navigate={(id) => { setDemoOpen(false); navigate(id); }} />}
+        {payPlan && <UpgradeModal planName={payPlan} onClose={() => setPayPlan(null)} onActivate={activatePlan} />}
+        {toast && <div role="status" className="fixed bottom-5 start-1/2 -translate-x-1/2 z-[70] px-4 py-2.5 rounded-xl bg-sky-500 text-[#03081a] text-sm font-semibold shadow-xl max-w-[90vw]">{toast}</div>}
+      </div>
+    </AppCtx.Provider>
+  );
+}
+
+function NavBtn({ active, children, icon: Icon, ...rest }) {
+  return <button {...rest} className={`px-3 py-2 rounded-lg flex items-center gap-1.5 transition-colors ${active ? 'text-sky-400 bg-sky-500/10 font-bold' : 'hover:text-sky-300'}`}>{Icon && <Icon className="w-4 h-4" />}{children}</button>;
+}
+const MobBtn = ({ children, ...p }) => <button {...p} className="p-2 text-start text-sm text-[#dbe6f7] hover:bg-[#14295c] rounded-lg flex items-center gap-2">{children}</button>;
+
+/* ---------- Footer with brand strip ---------- */
+function Footer() {
+  const { t, navigate } = useApp();
+  return (
+    <footer className="border-t border-[#14295c] bg-[#030817] mt-10">
+      <div className="max-w-7xl mx-auto px-4 py-6 grid grid-cols-1 md:grid-cols-4 gap-5 items-center">
+        {[[Globe, t.strip.global, t.strip.globalSub], [ShieldCheck, t.strip.secure, t.strip.secureSub], [Zap, t.strip.powered, t.strip.poweredSub]].map(([I, a, b], i) => (
+          <div key={i} className="flex items-center gap-3"><I className="w-9 h-9 text-sky-400 shrink-0" strokeWidth={1.5} /><div><div className="font-bold text-white text-sm">{a}</div><div className="text-xs text-[#9db4d9]">{b}</div></div></div>
+        ))}
+        <div className="flex items-center gap-3 md:justify-end"><span className="italic font-extrabold text-xl text-white">{t.strip.slogan}</span></div>
+      </div>
+      <div className="border-t border-[#0f1f47] py-4 px-4 text-xs text-[#6b86b8] flex flex-wrap items-center justify-center gap-x-5 gap-y-2">
+        <span>© {new Date().getFullYear()} AutoMind AI · Founded by P. A. Jamali</span>
+        <button onClick={() => navigate('about')} className="hover:text-sky-300">{t.nav.about}</button>
+        <button onClick={() => navigate('contact')} className="hover:text-sky-300">{t.nav.contact}</button>
+        <button onClick={() => navigate('pricing')} className="hover:text-sky-300">{t.nav.pricing}</button>
+      </div>
+    </footer>
+  );
+}
+
+/* ---------- Modals ---------- */
+function Modal({ title, icon: Icon, onClose, children }) {
+  return (
+    <div className="fixed inset-0 z-[60] bg-black/70 backdrop-blur-sm flex items-center justify-center p-4" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
+      <div role="dialog" aria-modal="true" className="w-full max-w-md bg-[#0a1a3f] border border-[#1f3d7a] rounded-3xl p-6 space-y-4 relative max-h-[90vh] overflow-y-auto">
+        <button onClick={onClose} className="absolute top-4 end-4 text-[#9db4d9] hover:text-white" aria-label="Close"><X className="w-5 h-5" /></button>
+        <h3 className="text-lg font-bold text-white flex items-center gap-2">{Icon && <Icon className="w-5 h-5 text-sky-400" />}{title}</h3>
+        {children}
+      </div>
+    </div>
+  );
+}
+
+function KeyModal({ apiKey, setApiKey, proxy, setProxy, onClose, notify }) {
+  const [val, setVal] = useState(apiKey);
+  const [pv, setPv] = useState(proxy || '');
+  const [test, setTest] = useState('');
+  const runTest = async () => {
+    setTest('Testing…');
+    PROXY_URL = /^https:\/\//i.test(pv.trim()) ? pv.trim() : '';
+    try {
+      const r = await askGemini({ messages: [{ role: 'user', text: 'Reply with the single word: OK' }], apiKey: val });
+      setTest(`✅ Key works. AI replied: ${r.slice(0, 40)}`);
+    } catch (e) { setTest(`❌ ${friendlyError(e)}`); }
+  };
+  return (
+    <Modal title="Gemini API key" icon={Key} onClose={onClose}>
+      <a href="https://aistudio.google.com/apikey" target="_blank" rel="noreferrer" className={UI.primary + ' w-full'}><Key className="w-4 h-4" /> Create my free API key (opens Google)</a>
+      <ol className="text-sm text-[#c3d3ee] space-y-1 list-decimal ps-5">
+        <li>Sign in with your Google account.</li>
+        <li>Click <strong className="text-white">Create API key</strong>.</li>
+        <li>Copy the key (starts with <code>AIza</code>) and paste it below.</li>
+      </ol>
+      <input type="password" autoComplete="off" value={val} onChange={(e) => setVal(e.target.value)} placeholder="AIza…" className={UI.input} />
+      <div>
+        <label className={UI.label}>Proxy URL (optional — use this if the AI cannot connect without a VPN)</label>
+        <input value={pv} onChange={(e) => setPv(e.target.value)} placeholder="https://your-name.workers.dev" className={UI.input} />
+        <p className="text-[11px] text-[#7e98c6] mt-1">Deploy the free <code>gemini-proxy-worker.js</code> on Cloudflare Workers and paste its address here.</p>
+      </div>
+      <p className="text-xs text-[#7e98c6]">The key is saved only in this browser and sent only to Google. For a public website, route requests through your own server (see CONFIG.API_BASE) so the key is never exposed.</p>
+      <button type="button" onClick={runTest} disabled={!val.trim()} className={UI.ghost + ' w-full'}><Zap className="w-4 h-4" /> Test key</button>
+      {test && <div className="text-xs text-[#dbe6f7] p-3 rounded-xl bg-[#050b1f] border border-[#17306a] leading-relaxed break-words">{test}</div>}
+      <div className="flex gap-2">
+        <button onClick={() => { setApiKey(val.replace(/[\s"'`]/g, '')); setProxy(pv.trim()); notify(val.trim() ? 'API key saved' : 'API key removed'); onClose(); }} className={UI.primary + ' flex-1'}>Save</button>
+        {apiKey && <button onClick={() => { setApiKey(''); notify('API key removed'); onClose(); }} className={UI.ghost}>Remove</button>}
+      </div>
+    </Modal>
+  );
+}
+
+function DemoModal({ onClose, navigate }) {
+  const steps = [
+    ['doctor', Stethoscope, 'Describe a problem', 'Tell the AI Car Doctor your symptoms or an OBD-II code and get likely causes and next steps.'],
+    ['scanner', Camera, 'Scan a photo', 'Upload a dashboard warning light or engine-bay photo for an instant explanation.'],
+    ['customizer', Palette, 'Design your car', 'Describe paint, wheels and body kit and generate a render.'],
+    ['comparison', Scale, 'Compare & decide', 'Put two cars side-by-side before you buy.'],
+  ];
+  return (
+    <Modal title="Quick tour" icon={PlayCircle} onClose={onClose}>
+      <div className="space-y-2">
+        {steps.map(([id, I, a, b], i) => (
+          <button key={id} onClick={() => navigate(id)} className="w-full flex gap-3 p-3 rounded-xl bg-[#050b1f] border border-[#17306a] hover:border-sky-400 text-start">
+            <span className="w-8 h-8 rounded-lg bg-sky-500/15 text-sky-300 flex items-center justify-center font-bold shrink-0">{i + 1}</span>
+            <span><span className="block text-white font-semibold text-sm flex items-center gap-1.5"><I className="w-4 h-4 text-sky-400" />{a}</span><span className="block text-xs text-[#9db4d9] mt-0.5">{b}</span></span>
+          </button>
+        ))}
+      </div>
+    </Modal>
+  );
+}
+
+function UpgradeModal({ planName, onClose, onActivate }) {
+  const link = CONFIG.PAYMENT_LINKS[planName];
+  const price = PLANS[planName].price;
+  return (
+    <Modal title={`Upgrade to ${planName}`} icon={Sparkles} onClose={onClose}>
+      <p className="text-sm text-[#c3d3ee]">${price}/month</p>
+      {link ? (
+        <>
+          <p className="text-xs text-[#9db4d9]">You'll complete payment on a secure hosted checkout page. Come back afterwards and activate your plan.</p>
+          <a href={link} target="_blank" rel="noreferrer" className={UI.primary + ' w-full'}><Lock className="w-4 h-4" /> Pay ${price} securely</a>
+          <button onClick={() => onActivate(planName)} className={UI.ghost + ' w-full'}>I've completed payment</button>
+        </>
+      ) : (
+        <>
+          <div className="p-3 rounded-xl bg-amber-950/40 border border-amber-700/50 text-xs text-amber-200">Demo mode: no payment is collected and the plan is stored only in this browser. To charge real money, paste a Stripe or PayPal payment link into <code>CONFIG.PAYMENT_LINKS</code> and verify payments on a server.</div>
+          <button onClick={() => onActivate(planName)} className={UI.primary + ' w-full'}>Activate {planName} (demo)</button>
+        </>
+      )}
+    </Modal>
+  );
+}
+
+/* =====================================================================
+   HOME
+   ===================================================================== */
+const PAINTS = [['#dc2626', 'Red'], ['#1d4ed8', 'Blue'], ['#111827', 'Black'], ['#e5e7eb', 'White']];
+
+function HomeView({ openDemo }) {
+  const { t, navigate, langName } = useApp();
+  const [paint, setPaint] = useState('#e5e7eb');
+  const [c1, setC1] = useState('Toyota Corolla');
+  const [c2, setC2] = useState('Honda Civic');
+  const chat = useChat(() => baseSystem(langName) + ' Keep answers concise (under 150 words).', t.home.chatWelcome);
+
+  return (
+    <div className="pb-6">
+      {/* HERO */}
+      <section className="relative overflow-hidden border-b border-[#0f1f47]">
+        <Skyline className="absolute bottom-0 end-0 w-full lg:w-[62%] h-[80%] opacity-70" />
+        <div className="absolute inset-0 bg-gradient-to-r from-[#040a1c] via-[#040a1c]/60 to-transparent" />
+        <div className="relative max-w-7xl mx-auto px-4 pt-12 pb-10 grid lg:grid-cols-2 gap-6 items-center">
+          <div className="space-y-6 z-10">
+            <h1 className="text-5xl sm:text-7xl font-black italic tracking-tight leading-[1.02]">
+              <span className="block text-white">{t.hero.title1}</span>
+              <span className="block bg-gradient-to-r from-sky-400 to-blue-500 bg-clip-text text-transparent">{t.hero.title2}</span>
+            </h1>
+            <p className="text-xl sm:text-2xl italic text-[#dbe6f7]">{t.hero.sub}</p>
+            <div className="flex flex-wrap gap-4 pt-2">
+              <button onClick={() => navigate('doctor')} className="px-7 py-3.5 rounded-full bg-gradient-to-r from-sky-500 to-blue-600 text-white font-bold flex items-center gap-2 shadow-lg shadow-blue-600/40 hover:brightness-110"><Rocket className="w-5 h-5" />{t.hero.explore}<ArrowRight className="w-4 h-4 rtl:rotate-180" /></button>
+              <button onClick={openDemo} className="px-7 py-3.5 rounded-full border border-sky-500/60 bg-[#081433]/70 text-white font-semibold flex items-center gap-2 hover:bg-[#0f2150]"><PlayCircle className="w-5 h-5 text-sky-400" />{t.hero.demo}</button>
+            </div>
+          </div>
+          <div className="relative z-10">
+            <CarArt color="#1d4ed8" accent="#38bdf8" className="w-full drop-shadow-[0_20px_40px_rgba(37,99,235,.45)]" />
+            <div className="h-1 -mt-3 mx-4 rounded-full bg-gradient-to-r from-transparent via-sky-400 to-transparent shadow-[0_0_30px_8px_rgba(56,189,248,.55)]" />
+          </div>
+        </div>
+      </section>
+
+      {/* TOOLS ROW */}
+      <section className="max-w-7xl mx-auto px-4 pt-8 space-y-5">
+        <SectionTitle>{t.home.toolsHeading}</SectionTitle>
+        <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4">
+          {HOME_TOOLS.map((id) => {
+            const tool = TOOLS.find((x) => x.id === id);
+            return (
+              <button key={id} onClick={() => navigate(id)} className="group relative text-center p-5 pb-9 rounded-2xl bg-gradient-to-b from-[#0d1c45] to-[#081230] border border-[#1b3a7e] hover:border-sky-400 hover:-translate-y-1 hover:shadow-xl hover:shadow-sky-500/10 transition-all">
+                <tool.icon className="w-10 h-10 mx-auto text-sky-400 mb-3" strokeWidth={1.6} />
+                <div className="font-bold text-white text-[15px]">{t.tools[id][0]}</div>
+                <div className="text-xs text-[#a9bfe6] mt-1">{t.tools[id][1]}</div>
+                <span className="absolute bottom-2.5 end-2.5 w-7 h-7 rounded-full border border-sky-500/70 flex items-center justify-center text-sky-400 group-hover:bg-sky-500 group-hover:text-[#03081a] transition-colors"><ChevronRight className="w-4 h-4 rtl:rotate-180" /></span>
+              </button>
+            );
+          })}
+        </div>
+        <div className="text-center"><details className="inline-block text-start group"><summary className="cursor-pointer text-sm text-sky-400 hover:text-sky-300 list-none">+ {TOOLS.length - HOME_TOOLS.length} more tools</summary>
+          <div className="mt-3 flex flex-wrap justify-center gap-2">{TOOLS.filter((x) => !HOME_TOOLS.includes(x.id)).map((tool) => <button key={tool.id} onClick={() => navigate(tool.id)} className="px-3 py-1.5 rounded-full bg-[#0f2150] border border-[#1f3d7a] text-xs flex items-center gap-1.5 hover:border-sky-400"><tool.icon className="w-3.5 h-3.5 text-sky-400" />{t.tools[tool.id][0]}</button>)}</div></details></div>
+      </section>
+
+      {/* THREE PANELS */}
+      <section className="max-w-7xl mx-auto px-4 pt-6 grid lg:grid-cols-3 gap-5">
+        {/* Studio */}
+        <div className={`${UI.card} p-5 flex flex-col`}>
+          <PanelHead icon={Palette} title={t.home.studioTitle} sub={t.home.studioSub} />
+          <div className="flex-1 grid grid-cols-[1fr_auto] gap-3 items-center py-3">
+            <CarArt color={paint} accent="#60a5fa" className="w-full" />
+            <div className="flex flex-col gap-2">{PAINTS.map(([c, n]) => <button key={c} onClick={() => setPaint(c)} aria-label={n} className={`w-14 h-9 rounded-lg border-2 ${paint === c ? 'border-sky-400' : 'border-[#1f3d7a]'}`} style={{ background: c }} />)}</div>
+          </div>
+          <div className="flex justify-center"><button onClick={() => navigate('customizer')} className={UI.primary + ' !rounded-full'}>{t.home.tryNow} <ArrowRight className="w-4 h-4 rtl:rotate-180" /></button></div>
+        </div>
+        {/* Compare */}
+        <div className={`${UI.card} p-5 flex flex-col`}>
+          <PanelHead icon={Scale} title={t.home.compareTitle} sub={t.home.compareSub} />
+          <div className="flex-1 grid grid-cols-[1fr_auto_1fr] items-center gap-2 py-3">
+            <div className="space-y-2"><CarArt color="#e5e7eb" accent="#60a5fa" className="w-full" /><input value={c1} onChange={(e) => setC1(e.target.value)} aria-label="Car 1" className={UI.input + ' text-center !py-1.5 !rounded-full text-xs'} /></div>
+            <span className="text-3xl font-black italic text-sky-400">VS</span>
+            <div className="space-y-2"><CarArt color="#dc2626" accent="#f87171" className="w-full" /><input value={c2} onChange={(e) => setC2(e.target.value)} aria-label="Car 2" className={UI.input + ' text-center !py-1.5 !rounded-full text-xs'} /></div>
+          </div>
+          <div className="flex justify-center"><button onClick={() => navigate('comparison', { car1: c1, car2: c2 })} className={UI.primary + ' !rounded-full'}>{t.home.compareNow} <ArrowRight className="w-4 h-4 rtl:rotate-180" /></button></div>
+        </div>
+        {/* Chat */}
+        <div className={`${UI.card} p-5 flex flex-col`}>
+          <PanelHead icon={Bot} title={t.home.chatTitle} sub={t.home.chatSub} />
+          <div className="flex-1 pt-3"><ChatBox chat={chat} placeholder={t.home.chatPlaceholder} height="h-[170px]" compact /></div>
+          <KeyHint />
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function KeyHint() {
+  const { hasKey, openKey } = useApp();
+  if (hasKey) return null;
+  return <button onClick={openKey} className="mt-2 text-xs text-amber-300 hover:text-amber-200 flex items-center gap-1 self-start"><Key className="w-3 h-3" /> Add your free Gemini key to enable AI</button>;
+}
+const SectionTitle = ({ children }) => (
+  <div className="flex items-center gap-4"><span className="flex-1 h-px bg-gradient-to-r from-transparent to-sky-500/70" /><h2 className="text-2xl font-bold text-white text-center">{children}</h2><span className="flex-1 h-px bg-gradient-to-l from-transparent to-sky-500/70" /></div>
+);
+const PanelHead = ({ icon: I, title, sub }) => (
+  <div className="flex items-center gap-3"><I className="w-8 h-8 text-sky-400 shrink-0" strokeWidth={1.7} /><div><div className="font-bold text-white text-lg leading-tight">{title}</div><div className="text-xs text-[#a9bfe6]">{sub}</div></div></div>
+);
+
+/* =====================================================================
+   ABOUT / CONTACT
+   ===================================================================== */
+function AboutView() {
+  return (
+    <Page icon={Info} title="About AutoMind AI" subtitle="Founded by P. A. Jamali to make automotive knowledge and troubleshooting accessible worldwide.">
+      <div className="grid md:grid-cols-2 gap-5">
+        <div className={`${UI.card} p-6 space-y-2`}><h3 className="font-bold text-white flex items-center gap-2"><Sparkles className="w-5 h-5 text-sky-400" /> Mission</h3><p className="text-sm text-[#c3d3ee] leading-relaxed">AutoMind AI simplifies vehicle questions with AI — from diagnosing symptoms to comparing cars — so owners can walk into a workshop or showroom better informed.</p></div>
+        <div className={`${UI.card} p-6 space-y-2`}><h3 className="font-bold text-white flex items-center gap-2"><Globe className="w-5 h-5 text-sky-400" /> Multilingual</h3><p className="text-sm text-[#c3d3ee] leading-relaxed">The interface and every AI answer are available in English, Urdu and Arabic, including right-to-left layout.</p></div>
+      </div>
+      <div className="p-4 rounded-xl bg-[#0b1633] border border-[#17306a] text-xs text-[#9db4d9]">AI answers are guidance only and can be wrong. They do not replace a physical inspection by a qualified mechanic.</div>
+    </Page>
+  );
+}
+
+function ContactView() {
+  const { notify } = useApp();
+  const [f, setF] = useState({ name: '', email: '', msg: '' });
+  const send = (e) => {
+    e.preventDefault();
+    const body = `${f.msg}\n\n— ${f.name} (${f.email})`;
+    window.location.href = `mailto:${CONFIG.CONTACT_EMAIL}?subject=${encodeURIComponent('AutoMind AI inquiry')}&body=${encodeURIComponent(body)}`;
+    notify('Opening your email app…');
+  };
+  return (
+    <Page icon={Mail} title="Contact Us" subtitle="Partnerships, support and enterprise inquiries." width="max-w-2xl">
+      <form onSubmit={send} className={`${UI.card} p-6 space-y-4`}>
+        <div><label className={UI.label}>Your name</label><input required value={f.name} onChange={(e) => setF({ ...f, name: e.target.value })} className={UI.input} /></div>
+        <div><label className={UI.label}>Email</label><input required type="email" value={f.email} onChange={(e) => setF({ ...f, email: e.target.value })} className={UI.input} /></div>
+        <div><label className={UI.label}>Message</label><textarea required rows={4} value={f.msg} onChange={(e) => setF({ ...f, msg: e.target.value })} className={UI.input} /></div>
+        <button className={UI.primary + ' w-full'}><Mail className="w-4 h-4" /> Send message</button>
+        <p className="text-xs text-[#7e98c6]">This opens your email app addressed to {CONFIG.CONTACT_EMAIL}.</p>
+      </form>
+    </Page>
+  );
+}
+
+/* =====================================================================
+   AI CAR DOCTOR (chat diagnostics)
+   ===================================================================== */
+function DoctorView() {
+  const { t, langName } = useApp();
+  const [veh, setVeh] = useState('');
+  const [pt, setPt] = useState('Petrol / Gasoline');
+  const [km, setKm] = useState('');
+  const sys = () => baseSystem(langName) + ` You are the "AI Car Doctor": diagnose symptoms and OBD-II codes. Vehicle: ${veh || 'unspecified'}; powertrain: ${pt}; mileage: ${km || 'unknown'}. Ask a clarifying question if the symptom is vague. Give likely causes ranked by probability, quick checks the owner can do, urgency (safe to drive / drive carefully / stop now) and rough repair cost ranges.`;
+  const chat = useChat(sys, 'Hello! Describe your car\'s symptoms, warning lights, or an OBD-II code (e.g. P0300), and tell me the vehicle on the left for better results.');
+  return (
+    <Page icon={Stethoscope} title={t.tools.doctor[0]} subtitle="Troubleshoot symptoms, warning lights and OBD-II codes." width="max-w-6xl">
+      <div className={`${UI.card} p-5 grid lg:grid-cols-12 gap-6`}>
+        <div className="lg:col-span-4 space-y-4">
+          <h3 className="text-xs font-bold uppercase tracking-wider text-sky-400">Vehicle</h3>
+          <div><label className={UI.label}>Make, model & year</label><input value={veh} onChange={(e) => setVeh(e.target.value)} placeholder="Toyota Camry 2021" className={UI.input} /></div>
+          <div><label className={UI.label}>Powertrain</label><select value={pt} onChange={(e) => setPt(e.target.value)} className={UI.input}><option>Petrol / Gasoline</option><option>Diesel</option><option>Hybrid (HEV/PHEV)</option><option>Electric (EV)</option></select></div>
+          <div><label className={UI.label}>Mileage (optional)</label><input value={km} onChange={(e) => setKm(e.target.value)} placeholder="85,000 km" className={UI.input} /></div>
+          <button onClick={chat.reset} className={UI.ghost + ' w-full !py-2 text-xs'}><RefreshCw className="w-3.5 h-3.5" /> New conversation</button>
+        </div>
+        <div className="lg:col-span-8"><ChatBox chat={chat} placeholder="e.g. Check engine light and rough idle…" chips={['Check engine light is on', 'Grinding noise when braking', "Car won't start", 'Steering wheel vibrates']} /></div>
+      </div>
+    </Page>
+  );
+}
+
+/* =====================================================================
+   GENERIC AI FORM TOOL
+   ===================================================================== */
+function ToolPage({ id, icon, title, subtitle, fields, buildPrompt, system, submit, children, width }) {
+  const { apiKey, langName, prefill } = useApp();
+  const [vals, setVals] = useState(() => { const o = {}; fields.forEach((f) => { o[f.key] = prefill?.[id]?.[f.key] ?? f.default ?? (f.options ? f.options[0] : ''); }); return o; });
+  const [loading, setLoading] = useState(false);
+  const [result, setResult] = useState('');
+  const [error, setError] = useState('');
+
+  const run = async (e) => {
+    e.preventDefault();
+    if (loading) return;
+    setLoading(true); setError(''); setResult('');
+    try {
+      const r = await askGemini({ messages: [{ role: 'user', text: buildPrompt(vals, langName) }], system: system(langName), apiKey });
+      setResult(r);
+    } catch (err) { setError(friendlyError(err)); }
+    finally { setLoading(false); }
+  };
+
+  return (
+    <Page icon={icon} title={title} subtitle={subtitle} width={width}>
+      <form onSubmit={run} className={`${UI.card} p-6 space-y-4`}>
+        <div className="grid sm:grid-cols-2 gap-4">{fields.map((f) => <Field key={f.key} f={f} value={vals[f.key]} onChange={(v) => setVals((p) => ({ ...p, [f.key]: v }))} />)}</div>
+        <button type="submit" disabled={loading} className={UI.primary + ' w-full'}>{loading ? <><Loader2 className="w-4 h-4 animate-spin" /> Working…</> : <><Sparkles className="w-4 h-4" /> {submit}</>}</button>
+      </form>
+      <ResultBox text={result} error={error} />
+      {children}
+    </Page>
+  );
+}
+
+const ComparisonView = () => {
+  const { t } = useApp();
+  return <ToolPage id="comparison" icon={Scale} title={t.tools.comparison[0]} subtitle="Side-by-side specs, strengths and a verdict." submit="Compare vehicles"
+    fields={[{ key: 'car1', label: 'Vehicle 1', default: 'Honda Civic 2023', required: true }, { key: 'car2', label: 'Vehicle 2', default: 'Toyota Corolla 2023', required: true }, { key: 'priority', label: 'What matters most?', options: ['Balanced', 'Fuel economy', 'Performance', 'Reliability', 'Family space', 'Value for money', 'Low running costs'], wide: true }]}
+    system={baseSystem}
+    buildPrompt={(v) => `Compare ${v.car1} vs ${v.car2}. Priority: ${v.priority}. Give a markdown table (engine/power, transmission, fuel economy, boot space, safety, typical reliability, typical price range), then pros/cons for each and a clear verdict. Say figures are approximate and vary by market and trim.`} />;
+};
+
+const RepairGuideView = () => {
+  const { t } = useApp();
+  return <ToolPage id="mechanic" icon={Wrench} title={t.tools.mechanic[0]} subtitle="Step-by-step repair guidance for common jobs." submit="Get repair guide"
+    fields={[{ key: 'vehicle', label: 'Vehicle', placeholder: 'Honda Civic 2019 1.5T', required: true }, { key: 'job', label: 'Repair or job', placeholder: 'Replace front brake pads', required: true }, { key: 'skill', label: 'Your skill level', options: ['Beginner', 'Intermediate', 'Advanced'], wide: true }]}
+    system={baseSystem}
+    buildPrompt={(v) => `Write a DIY repair guide: "${v.job}" on a ${v.vehicle} for a ${v.skill} DIYer. Include: difficulty and time, tools and parts list, safety warnings, numbered steps, common mistakes, and when to go to a professional. Do not invent torque values — tell the user to check the factory service manual.`} />;
+};
+
+const BuyingAdvisorView = () => {
+  const { t } = useApp();
+  return <ToolPage id="buyingAdvisor" icon={Compass} title={t.tools.buyingAdvisor[0]} subtitle="Personalized car recommendations and inspection checklists." submit="Get recommendations"
+    fields={[{ key: 'budget', label: 'Budget', default: '$25,000', required: true }, { key: 'market', label: 'Country / market', placeholder: 'Pakistan, UAE, USA…' }, { key: 'fuel', label: 'Fuel preference', options: ['Any', 'Petrol', 'Diesel', 'Hybrid', 'Electric'] }, { key: 'new', label: 'New or used', options: ['Either', 'New', 'Used'] }, { key: 'needs', label: 'Key requirements', default: 'Family daily commute with high fuel economy', wide: true, required: true }]}
+    system={baseSystem}
+    buildPrompt={(v) => `Recommend the top 3 cars. Budget: ${v.budget}. Market: ${v.market || 'unspecified'}. Fuel: ${v.fuel}. Condition: ${v.new}. Needs: ${v.needs}. For each: why it fits, trade-offs, typical running costs. Finish with a pre-purchase inspection checklist.`} />;
+};
+
+const PartsFinderView = () => {
+  const { t } = useApp();
+  return <ToolPage id="partsFinder" icon={Cog} title={t.tools.partsFinder[0]} subtitle="Find compatible OEM and aftermarket parts." submit="Search parts"
+    fields={[{ key: 'q', label: 'Part and vehicle', default: 'Brake pads for 2021 Honda Civic', wide: true, required: true }, { key: 'type', label: 'Preference', options: ['OEM or aftermarket', 'OEM only', 'Aftermarket only', 'Budget option'], wide: true }]}
+    system={baseSystem}
+    buildPrompt={(v) => `Help find compatible parts for: ${v.q}. Preference: ${v.type}. List reputable brands, typical price ranges, fitment notes and what to check. Do NOT invent part numbers — if unsure, tell the user to confirm with the VIN at a dealer or an official parts catalogue.`} />;
+};
+
+const InsuranceView = () => {
+  const { t } = useApp();
+  return <ToolPage id="insurance" icon={ShieldCheck} title={t.tools.insurance[0]} subtitle="Understand coverage types, deductibles and premium factors." submit="Get coverage advice"
+    fields={[{ key: 'vehicle', label: 'Vehicle', default: '2023 Toyota RAV4', required: true }, { key: 'region', label: 'Country / region', placeholder: 'e.g. UAE' }, { key: 'driver', label: 'Driver profile', options: ['Experienced driver', 'New driver', 'Young driver (under 25)', 'Fleet / business use'] }, { key: 'goal', label: 'Goal', options: ['Best balance', 'Lowest premium', 'Maximum protection'] }]}
+    system={baseSystem}
+    buildPrompt={(v) => `Explain insurance for a ${v.vehicle}. Region: ${v.region || 'unspecified'}. Driver: ${v.driver}. Goal: ${v.goal}. Cover: coverage types, how deductibles work, what drives the premium, recommended coverage and money-saving tips. Do not quote exact premiums — give rough ranges only if confident. This is general information, not a quote.`} />;
+};
+
+/* =====================================================================
+   PRICE ESTIMATOR (AI + local rule-of-thumb)
+   ===================================================================== */
+function EstimatorView() {
+  const { t } = useApp();
+  const [np, setNp] = useState('30000');
+  const [age, setAge] = useState('3');
+  const [km, setKm] = useState('45000');
+  const a = Math.max(0, Number(age) || 0), price = Number(np) || 0, odo = Number(km) || 0;
+  let val = a === 0 ? price * 0.92 : price * 0.85 * Math.pow(0.9, a - 1);
+  const adj = Math.max(-0.15, Math.min(0.15, -((odo - a * 15000) / 10000) * 0.015));
+  val = Math.max(0, val * (1 + adj));
+  const fmt = (n) => Math.round(n).toLocaleString();
+  return (
+    <ToolPage id="estimator" icon={Tag} title={t.tools.estimator[0]} subtitle="AI market-value estimate, plus a quick depreciation calculator." submit="Estimate value"
+      fields={[{ key: 'car', label: 'Make, model & trim', placeholder: 'Toyota Corolla Altis', required: true }, { key: 'year', label: 'Year', type: 'number', default: '2022', required: true }, { key: 'km', label: 'Mileage (km or miles)', type: 'number', default: '45000', required: true }, { key: 'cond', label: 'Condition', options: ['Excellent', 'Good', 'Fair', 'Needs work'] }, { key: 'market', label: 'Country / market', placeholder: 'Pakistan, UAE, USA…' }, { key: 'cur', label: 'Currency', options: ['USD ($)', 'PKR (Rs)', 'AED', 'EUR (€)', 'SAR', 'GBP (£)'] }]}
+      system={baseSystem}
+      buildPrompt={(v) => `Estimate the used-market value of: ${v.car}, year ${v.year}, mileage ${v.km}, condition ${v.cond}, market ${v.market || 'unspecified'}. Currency: ${v.cur}. Give a low–typical–high price range, the main factors that move the price, expected depreciation over the next 2 years and tips to get a better price. State clearly that this is an estimate, not a live listing price.`}>
+      <div className={`${UI.card} p-6 space-y-4`}>
+        <h3 className="font-bold text-white flex items-center gap-2"><Calculator className="w-5 h-5 text-sky-400" /> Quick depreciation calculator <span className="text-xs font-normal text-[#9db4d9]">(works offline)</span></h3>
+        <div className="grid sm:grid-cols-3 gap-4">
+          <div><label className={UI.label}>Original price</label><input type="number" value={np} onChange={(e) => setNp(e.target.value)} className={UI.input} /></div>
+          <div><label className={UI.label}>Age (years)</label><input type="number" min="0" value={age} onChange={(e) => setAge(e.target.value)} className={UI.input} /></div>
+          <div><label className={UI.label}>Mileage</label><input type="number" value={km} onChange={(e) => setKm(e.target.value)} className={UI.input} /></div>
+        </div>
+        <div className="p-4 rounded-xl bg-[#050b1f] border border-[#17306a] flex flex-wrap items-end justify-between gap-2">
+          <div><div className="text-xs text-[#9db4d9]">Estimated value</div><div className="text-3xl font-black text-emerald-400 font-mono">{fmt(val)}</div></div>
+          <div className="text-sm text-[#c3d3ee]">Likely range: {fmt(val * 0.92)} – {fmt(val * 1.08)}</div>
+        </div>
+        <p className="text-xs text-[#7e98c6]">Rule of thumb: about 15% loss in year 1, 10%/year after, adjusted for mileage versus 15,000/year. Real prices vary by market and model.</p>
+      </div>
+    </ToolPage>
+  );
+}
+
+/* =====================================================================
+   IMAGE ANALYZER (scanner + damage)
+   ===================================================================== */
+function ImageAnalyzer({ icon: Icon, title, subtitle, pickLabel, hint, btnLabel, buildPrompt }) {
+  const { apiKey, langName, profile, checkScan, recordScan } = useApp();
+  const [image, setImage] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [result, setResult] = useState('');
+  const [error, setError] = useState('');
+
+  const onFile = async (e) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+    try { setImage(await prepareImage(file)); setResult(''); setError(''); } catch (err) { setError(err.message); }
+  };
+  const run = async () => {
+    if (!image || loading || !checkScan()) return;
+    setLoading(true); setError(''); setResult('');
+    try { setResult(await askGeminiVision({ prompt: buildPrompt(langName), image, apiKey })); recordScan(); }
+    catch (err) { setError(friendlyError(err)); }
+    finally { setLoading(false); }
+  };
+  return (
+    <Page icon={Icon} title={title} subtitle={subtitle}>
+      <div className="flex justify-end"><span className="text-xs font-mono px-3 py-1 rounded-full bg-sky-950 border border-sky-800 text-sky-300">Scans this month: {profile.scansUsed}/{profile.maxScans === Infinity ? '∞' : profile.maxScans}</span></div>
+      <div className={`${UI.card} p-8 border-2 border-dashed text-center space-y-4`}>
+        {image ? (
+          <>
+            <img src={image.dataUrl} alt="Selected" className="max-h-72 mx-auto rounded-2xl border border-[#1f3d7a]" />
+            <div className="flex flex-wrap justify-center gap-3">
+              <label className={UI.ghost + ' cursor-pointer'}>Change photo<input type="file" accept="image/*" onChange={onFile} className="hidden" /></label>
+              <button onClick={run} disabled={loading} className={UI.primary}>{loading ? <><Loader2 className="w-4 h-4 animate-spin" /> Analyzing…</> : <><Sparkles className="w-4 h-4" /> {btnLabel}</>}</button>
+            </div>
+          </>
+        ) : (
+          <label className="block cursor-pointer space-y-2">
+            <Camera className="w-12 h-12 text-sky-400 mx-auto" />
+            <p className="font-bold text-white">{pickLabel}</p>
+            <p className="text-xs text-[#7e98c6]">{hint}</p>
+            <input type="file" accept="image/*" onChange={onFile} className="hidden" />
+          </label>
+        )}
+      </div>
+      <ResultBox text={result} error={error} />
+    </Page>
+  );
+}
+
+const ScannerView = () => {
+  const { t } = useApp();
+  return <ImageAnalyzer icon={Camera} title={t.tools.scanner[0]} subtitle="Upload a photo of a dashboard light, engine bay part or tire." pickLabel="Click to upload a photo" hint="JPG, PNG or WebP, up to 10MB" btnLabel="Analyze with AI"
+    buildPrompt={(lang) => `Analyze this automotive photo (dashboard warning light, engine-bay component, tire or part). Reply in ${lang}. 1) Identify what is visible. 2) Explain what it means and how serious it is (safe to drive / drive carefully / stop now). 3) Give practical next steps. If the image is not automotive or unclear, say so. Note that a photo cannot replace a physical inspection.`} />;
+};
+const DamageView = () => {
+  const { t } = useApp();
+  return <ImageAnalyzer icon={ShieldAlert} title={t.tools.damageAnalyzer[0]} subtitle="Photo-based damage assessment and preliminary repair guidance." pickLabel="Upload a collision damage photo" hint="Take the photo from a few steps back so the whole panel is visible" btnLabel="Assess damage"
+    buildPrompt={(lang) => `Analyze this vehicle damage photo. Reply in ${lang}. List visible damaged parts, severity (cosmetic / moderate / structural risk), possible hidden damage to check (frame, suspension, airbags, sensors), likely repair steps and a rough relative cost level (low/medium/high) — do not state exact prices. Remind the user that only an in-person inspection can confirm structural safety and that insurers need an official assessment.`} />;
+};
+
+/* =====================================================================
+   CUSTOMIZATION STUDIO
+   ===================================================================== */
+function CustomizerView() {
+  const { t, apiKey } = useApp();
+  const [base, setBase] = useState('sleek modern sports sedan');
+  const [paint, setPaint] = useState('Metallic electric blue');
+  const [wheels, setWheels] = useState('Forged black 5-spoke alloy rims');
+  const [kit, setKit] = useState('Carbon fiber front lip and subtle rear spoiler');
+  const [img, setImg] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+  const chips = { paint: ['Metallic electric blue', 'Matte black', 'Pearl white', 'Candy red', 'Racing green'], wheels: ['Forged black 5-spoke alloy rims', 'Bronze mesh wheels', 'Chrome multi-spoke rims'], kit: ['Carbon fiber front lip and subtle rear spoiler', 'Wide-body kit with large GT wing', 'Stock look, no body kit'] };
+
+  const generate = async () => {
+    setLoading(true); setError(''); setImg(null);
+    try {
+      setImg(await generateImage({ prompt: `Photorealistic studio render of a ${base}, painted ${paint}, with ${wheels} and ${kit}. Three-quarter front view, cinematic lighting, dark reflective showroom floor, no text, no logos, no brand badges.`, aspect: '16:9', apiKey }));
+    } catch (e) { setError(friendlyError(e)); } finally { setLoading(false); }
+  };
+  return (
+    <Page icon={Palette} title={t.tools.customizer[0]} subtitle="Describe your dream build and generate a custom render." width="max-w-6xl">
+      <div className={`${UI.card} p-5 grid lg:grid-cols-12 gap-6`}>
+        <div className="lg:col-span-8 rounded-2xl bg-[#050b1f] border border-[#17306a] min-h-[320px] flex items-center justify-center overflow-hidden relative">
+          {loading ? <div className="text-center space-y-3"><Loader2 className="w-10 h-10 text-sky-400 animate-spin mx-auto" /><p className="text-sm text-[#c3d3ee]">Rendering your car… this can take 10–20 seconds</p></div>
+            : img ? <><img src={img} alt="AI custom car render" className="w-full h-full object-cover" /><a href={img} download="automind-render.png" className="absolute bottom-3 end-3 px-3 py-1.5 rounded-lg bg-black/60 text-white text-xs flex items-center gap-1.5 hover:bg-black/80"><Download className="w-3.5 h-3.5" /> Download</a></>
+            : <div className="p-6 w-full"><CarArt color="#1d4ed8" className="w-full max-w-md mx-auto opacity-60" /><p className="text-center text-xs text-[#6b86b8] mt-2">Set your options and press “Generate render”</p></div>}
+        </div>
+        <div className="lg:col-span-4 space-y-4">
+          <div><label className={UI.label}>Base vehicle style</label><input value={base} onChange={(e) => setBase(e.target.value)} className={UI.input} /></div>
+          {[['Paint', paint, setPaint, chips.paint], ['Wheels', wheels, setWheels, chips.wheels], ['Body kit', kit, setKit, chips.kit]].map(([l, v, set, c]) => (
+            <div key={l}><label className={UI.label}>{l}</label><input value={v} onChange={(e) => set(e.target.value)} className={UI.input} />
+              <div className="flex flex-wrap gap-1.5 mt-1.5">{c.map((x) => <button key={x} type="button" onClick={() => set(x)} className="px-2 py-0.5 rounded-full text-[11px] bg-[#0f2150] border border-[#1f3d7a] text-sky-200 hover:border-sky-400">{x.length > 22 ? x.slice(0, 22) + '…' : x}</button>)}</div></div>
+          ))}
+          <button onClick={generate} disabled={loading} className={UI.primary + ' w-full'}>{loading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4" />} Generate render</button>
+        </div>
+      </div>
+      <ResultBox error={error} />
+    </Page>
+  );
+}
+
+/* =====================================================================
+   MECHANIC FINDER (real map search, no fake listings)
+   ===================================================================== */
+function MechanicFinderView() {
+  const { t } = useApp();
+  const [loc, setLoc] = useState('');
+  const [kind, setKind] = useState('car mechanic');
+  const [q, setQ] = useState('');
+  const kinds = ['car mechanic', 'car dealership service center', 'tyre shop', 'auto parts store', 'car wash', 'EV charging station', 'auto electrician', 'body shop'];
+  const search = (e) => { e?.preventDefault(); if (loc.trim()) setQ(`${kind} near ${loc.trim()}`); };
+  const useMine = () => {
+    if (!navigator.geolocation) return;
+    navigator.geolocation.getCurrentPosition((p) => { const c = `${p.coords.latitude.toFixed(5)},${p.coords.longitude.toFixed(5)}`; setLoc(c); setQ(`${kind} near ${c}`); }, () => alert('Location permission was denied. Type your city instead.'));
+  };
+  return (
+    <Page icon={MapPin} title={t.tools.mechanicFinder[0]} subtitle="Find real workshops, dealers and services on the map." width="max-w-5xl" needsKey={false}>
+      <form onSubmit={search} className={`${UI.card} p-4 grid sm:grid-cols-[1fr_auto_auto_auto] gap-3 items-center`}>
+        <input value={loc} onChange={(e) => setLoc(e.target.value)} placeholder="Enter city, area or zip code…" className={UI.input} />
+        <select value={kind} onChange={(e) => setKind(e.target.value)} className={UI.input + ' sm:w-56'}>{kinds.map((k) => <option key={k}>{k}</option>)}</select>
+        <button type="button" onClick={useMine} className={UI.ghost}><Navigation className="w-4 h-4" /> Near me</button>
+        <button type="submit" className={UI.primary}>Search</button>
+      </form>
+      {q ? (
+        <div className="space-y-3">
+          <iframe title="Map" src={`https://maps.google.com/maps?q=${encodeURIComponent(q)}&output=embed`} className="w-full h-[460px] rounded-2xl border border-[#17306a]" loading="lazy" referrerPolicy="no-referrer-when-downgrade" />
+          <a href={`https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(q)}`} target="_blank" rel="noreferrer" className="text-sm text-sky-400 hover:text-sky-300 inline-flex items-center gap-1">Open full results with ratings & reviews in Google Maps <ArrowRight className="w-4 h-4 rtl:rotate-180" /></a>
+        </div>
+      ) : <div className={`${UI.card} p-10 text-center text-sm text-[#9db4d9]`}>Enter a location to see nearby results.</div>}
+      <p className="text-xs text-[#7e98c6]">Tip: check recent reviews, ask for a written estimate, and compare two quotes before approving major repairs.</p>
+    </Page>
+  );
+}
+
+/* =====================================================================
+   FUEL ADVISOR (real calculator)
+   ===================================================================== */
+function FuelAdvisorView() {
+  const { t } = useApp();
+  const [dist, setDist] = useState('500');
+  const [dUnit, setDUnit] = useState('km');
+  const [eff, setEff] = useState('8');
+  const [eUnit, setEUnit] = useState('L/100km');
+  const [price, setPrice] = useState('1.2');
+  const [pUnit, setPUnit] = useState('per litre');
+  const [fuel, setFuel] = useState('Petrol');
+  const [round, setRound] = useState(false);
+  const [people, setPeople] = useState('1');
+  const [cur, setCur] = useState('$');
+
+  let km = (Number(dist) || 0) * (dUnit === 'miles' ? 1.60934 : 1) * (round ? 2 : 1);
+  const e = Number(eff) || 0;
+  let l100 = eUnit === 'L/100km' ? e : eUnit === 'km/L' ? (e ? 100 / e : 0) : e ? 235.215 / e : 0;
+  const litres = (km * l100) / 100;
+  const ppl = (Number(price) || 0) / (pUnit === 'per US gallon' ? 3.78541 : 1);
+  const cost = litres * ppl;
+  const n = Math.max(1, Number(people) || 1);
+  const co2 = litres * (fuel === 'Diesel' ? 2.68 : fuel === 'LPG' ? 1.51 : 2.31);
+  const f2 = (x) => x.toLocaleString(undefined, { maximumFractionDigits: 2 });
+  const tips = ['Keep tires inflated to the pressure on the door-jamb sticker.', 'Drive smoothly — hard acceleration and braking can raise consumption noticeably.', 'Remove roof racks and heavy cargo you do not need.', 'At highway speeds, air-conditioning with windows up beats open windows.', 'Replace clogged air filters and follow the oil-grade recommendation.'];
+
+  return (
+    <Page icon={Fuel} title={t.tools.fuelAdvisor[0]} subtitle="Calculate trip fuel, cost per person and CO₂ — instantly, no AI needed." width="max-w-5xl" needsKey={false}>
+      <div className="grid lg:grid-cols-5 gap-6">
+        <div className={`${UI.card} p-6 lg:col-span-3 space-y-4`}>
+          <div className="grid grid-cols-[1fr_auto] gap-3"><div><label className={UI.label}>Distance</label><input type="number" min="0" value={dist} onChange={(ev) => setDist(ev.target.value)} className={UI.input} /></div><div><label className={UI.label}>Unit</label><select value={dUnit} onChange={(ev) => setDUnit(ev.target.value)} className={UI.input}><option>km</option><option>miles</option></select></div></div>
+          <div className="grid grid-cols-[1fr_auto] gap-3"><div><label className={UI.label}>Fuel efficiency</label><input type="number" min="0" step="0.1" value={eff} onChange={(ev) => setEff(ev.target.value)} className={UI.input} /></div><div><label className={UI.label}>Unit</label><select value={eUnit} onChange={(ev) => setEUnit(ev.target.value)} className={UI.input}><option>L/100km</option><option>km/L</option><option>MPG (US)</option></select></div></div>
+          <div className="grid grid-cols-[auto_1fr_auto] gap-3"><div><label className={UI.label}>Currency</label><input value={cur} onChange={(ev) => setCur(ev.target.value)} className={UI.input + ' !w-20'} /></div><div><label className={UI.label}>Fuel price</label><input type="number" min="0" step="0.01" value={price} onChange={(ev) => setPrice(ev.target.value)} className={UI.input} /></div><div><label className={UI.label}>Per</label><select value={pUnit} onChange={(ev) => setPUnit(ev.target.value)} className={UI.input}><option>per litre</option><option>per US gallon</option></select></div></div>
+          <div className="grid grid-cols-2 gap-3"><div><label className={UI.label}>Fuel type</label><select value={fuel} onChange={(ev) => setFuel(ev.target.value)} className={UI.input}><option>Petrol</option><option>Diesel</option><option>LPG</option></select></div><div><label className={UI.label}>People sharing cost</label><input type="number" min="1" value={people} onChange={(ev) => setPeople(ev.target.value)} className={UI.input} /></div></div>
+          <label className="flex items-center gap-2 text-sm text-[#c3d3ee] cursor-pointer"><input type="checkbox" checked={round} onChange={(ev) => setRound(ev.target.checked)} className="accent-sky-400 w-4 h-4" /> Round trip (double the distance)</label>
+        </div>
+        <div className="lg:col-span-2 space-y-4">
+          <div className={`${UI.card} p-6 space-y-3 border-emerald-700/50`}>
+            <div className="text-xs text-[#9db4d9]">Total trip cost</div><div className="text-4xl font-black text-emerald-400 font-mono">{cur}{f2(cost)}</div>
+            <div className="grid grid-cols-2 gap-3 text-sm pt-2 border-t border-[#17306a]">
+              <div><div className="text-xs text-[#9db4d9]">Fuel needed</div><div className="font-bold text-white">{f2(litres)} L</div></div>
+              <div><div className="text-xs text-[#9db4d9]">Distance</div><div className="font-bold text-white">{f2(km)} km</div></div>
+              <div><div className="text-xs text-[#9db4d9]">Per person</div><div className="font-bold text-white">{cur}{f2(cost / n)}</div></div>
+              <div><div className="text-xs text-[#9db4d9]">Cost per km</div><div className="font-bold text-white">{cur}{f2(km ? cost / km : 0)}</div></div>
+              <div className="col-span-2"><div className="text-xs text-[#9db4d9]">Estimated CO₂</div><div className="font-bold text-white">{f2(co2)} kg</div></div>
+            </div>
+          </div>
+          <div className={`${UI.card} p-5`}><h3 className="font-bold text-white text-sm mb-2 flex items-center gap-2"><CheckCircle2 className="w-4 h-4 text-sky-400" /> Eco-driving tips</h3><ul className="space-y-1.5 text-xs text-[#c3d3ee]">{tips.map((x) => <li key={x} className="flex gap-2"><span className="text-sky-400">•</span>{x}</li>)}</ul></div>
+        </div>
+      </div>
+    </Page>
+  );
+}
+
+/* =====================================================================
+   MAINTENANCE MANAGER (garage + service logs + reminders)
+   ===================================================================== */
+const SERVICE_TYPES = { 'Oil Change': 6, 'Tire Rotation': 6, 'Brake Service': 12, 'Air Filter': 12, 'Coolant Flush': 24, 'Battery': 36, 'Other': 0 };
+const addMonths = (d, m) => { const x = new Date(d); x.setMonth(x.getMonth() + m); return x; };
+
+function vehicleReminders(vehicle, logs) {
+  const out = [];
+  Object.entries(SERVICE_TYPES).forEach(([type, months]) => {
+    if (!months) return;
+    const last = logs.filter((l) => l.vehicleId === vehicle.id && l.type === type).sort((a, b) => b.date.localeCompare(a.date))[0];
+    if (!last) return;
+    const due = addMonths(last.date, months);
+    const days = Math.round((due - new Date()) / 86400000);
+    out.push({ type, due: due.toISOString().slice(0, 10), days, state: days < 0 ? 'overdue' : days <= 30 ? 'soon' : 'ok' });
+  });
+  return out;
+}
+function vehicleStatus(vehicle, logs) {
+  const r = vehicleReminders(vehicle, logs);
+  if (!r.length) return ['No records', 'bg-slate-800 text-slate-300 border-slate-600'];
+  if (r.some((x) => x.state === 'overdue')) return ['Service Due', 'bg-rose-950 text-rose-300 border-rose-800'];
+  if (r.some((x) => x.state === 'soon')) return ['Due Soon', 'bg-amber-950 text-amber-300 border-amber-800'];
+  return ['Healthy', 'bg-emerald-950 text-emerald-300 border-emerald-800'];
+}
+
+function MaintenanceView() {
+  const { t, garage, setGarage, logs, setLogs, profile, notify, navigate } = useApp();
+  const [v, setV] = useState({ make: '', model: '', year: '', vin: '' });
+  const [l, setL] = useState({ vehicleId: '', type: 'Oil Change', date: todayStr(), odo: '', cost: '', notes: '' });
+
+  const addVehicle = (e) => {
+    e.preventDefault();
+    if (garage.length >= profile.maxCars) { notify(`Free plan allows ${profile.maxCars} vehicles. Upgrade for unlimited.`); navigate('pricing'); return; }
+    setGarage([...garage, { id: Date.now(), make: v.make.trim(), model: v.model.trim(), year: v.year || '', vin: v.vin.trim() }]);
+    setV({ make: '', model: '', year: '', vin: '' });
+    notify('Vehicle added');
+  };
+  const removeVehicle = (id) => { if (!confirm('Remove this vehicle and all its service logs?')) return; setGarage(garage.filter((x) => x.id !== id)); setLogs(logs.filter((x) => x.vehicleId !== id)); };
+  const addLog = (e) => {
+    e.preventDefault();
+    const vid = Number(l.vehicleId || garage[0]?.id);
+    if (!vid) { notify('Add a vehicle first.'); return; }
+    setLogs([{ id: Date.now(), vehicleId: vid, type: l.type, date: l.date, odo: l.odo, cost: l.cost === '' ? '' : Number(l.cost), notes: l.notes }, ...logs]);
+    setL({ ...l, odo: '', cost: '', notes: '' });
+    notify('Service logged');
+  };
+  const nameOf = (id) => { const x = garage.find((g) => g.id === id); return x ? `${x.year} ${x.make} ${x.model}`.trim() : 'Removed vehicle'; };
+
+  return (
+    <Page icon={Calendar} title={t.tools.maintenance[0]} subtitle="Your garage, service history and automatic reminders — saved on this device." width="max-w-6xl" needsKey={false}>
+      <div className="grid lg:grid-cols-2 gap-5">
+        <form onSubmit={addVehicle} className={`${UI.card} p-5 space-y-3`}>
+          <h3 className="font-bold text-white flex items-center gap-2"><Car className="w-5 h-5 text-sky-400" /> Add vehicle <span className="text-xs text-[#9db4d9] font-normal">({garage.length}/{profile.maxCars === Infinity ? '∞' : profile.maxCars})</span></h3>
+          <div className="grid grid-cols-3 gap-2"><input required placeholder="Make" value={v.make} onChange={(e) => setV({ ...v, make: e.target.value })} className={UI.input} /><input required placeholder="Model" value={v.model} onChange={(e) => setV({ ...v, model: e.target.value })} className={UI.input} /><input type="number" placeholder="Year" value={v.year} onChange={(e) => setV({ ...v, year: e.target.value })} className={UI.input} /></div>
+          <input placeholder="VIN (optional)" value={v.vin} onChange={(e) => setV({ ...v, vin: e.target.value })} className={UI.input} />
+          <button className={UI.primary}><Plus className="w-4 h-4" /> Save vehicle</button>
+        </form>
+        <form onSubmit={addLog} className={`${UI.card} p-5 space-y-3`}>
+          <h3 className="font-bold text-white flex items-center gap-2"><Wrench className="w-5 h-5 text-sky-400" /> Log a service</h3>
+          <div className="grid grid-cols-2 gap-2">
+            <select value={l.vehicleId} onChange={(e) => setL({ ...l, vehicleId: e.target.value })} className={UI.input}>{garage.length === 0 && <option value="">No vehicles yet</option>}{garage.map((g) => <option key={g.id} value={g.id}>{nameOf(g.id)}</option>)}</select>
+            <select value={l.type} onChange={(e) => setL({ ...l, type: e.target.value })} className={UI.input}>{Object.keys(SERVICE_TYPES).map((k) => <option key={k}>{k}</option>)}</select>
+            <input type="date" value={l.date} max={todayStr()} onChange={(e) => setL({ ...l, date: e.target.value })} className={UI.input} required />
+            <input type="number" placeholder="Odometer" value={l.odo} onChange={(e) => setL({ ...l, odo: e.target.value })} className={UI.input} />
+            <input type="number" step="0.01" placeholder="Cost" value={l.cost} onChange={(e) => setL({ ...l, cost: e.target.value })} className={UI.input} />
+            <input placeholder="Notes" value={l.notes} onChange={(e) => setL({ ...l, notes: e.target.value })} className={UI.input} />
+          </div>
+          <button disabled={!garage.length} className={UI.primary}><Plus className="w-4 h-4" /> Save log</button>
+        </form>
+      </div>
+
+      <div className="grid md:grid-cols-2 gap-4">
+        {garage.length === 0 && <div className={`${UI.card} p-8 text-center text-sm text-[#9db4d9] md:col-span-2`}>Your garage is empty. Add your first vehicle above.</div>}
+        {garage.map((g) => {
+          const [label, cls] = vehicleStatus(g, logs);
+          const rem = vehicleReminders(g, logs);
+          return (
+            <div key={g.id} className={`${UI.card} p-5 space-y-3`}>
+              <div className="flex justify-between items-start gap-2">
+                <div><div className="font-bold text-white">{nameOf(g.id)}</div>{g.vin && <div className="text-xs text-[#6b86b8] font-mono">VIN {g.vin}</div>}</div>
+                <div className="flex items-center gap-2"><span className={`px-2.5 py-0.5 rounded-full text-[11px] font-bold border ${cls}`}>{label}</span><button onClick={() => removeVehicle(g.id)} aria-label="Remove vehicle" className="text-[#6b86b8] hover:text-rose-400"><Trash2 className="w-4 h-4" /></button></div>
+              </div>
+              {rem.length > 0 && <div className="space-y-1">{rem.map((r) => <div key={r.type} className="flex justify-between text-xs"><span className="text-[#c3d3ee]">{r.type}</span><span className={r.state === 'overdue' ? 'text-rose-400' : r.state === 'soon' ? 'text-amber-300' : 'text-emerald-400'}>{r.state === 'overdue' ? `${-r.days}d overdue` : `due ${r.due}`}</span></div>)}</div>}
+            </div>
+          );
+        })}
+      </div>
+
+      {logs.length > 0 && (
+        <div className={`${UI.card} overflow-x-auto`}>
+          <table className="w-full text-sm"><thead><tr className="text-[#9db4d9] text-xs text-start">{['Date', 'Vehicle', 'Service', 'Odometer', 'Cost', 'Notes', ''].map((h) => <th key={h} className="p-3 text-start font-semibold">{h}</th>)}</tr></thead>
+            <tbody>{[...logs].sort((a, b) => b.date.localeCompare(a.date)).map((x) => (
+              <tr key={x.id} className="border-t border-[#17306a]"><td className="p-3 whitespace-nowrap">{x.date}</td><td className="p-3">{nameOf(x.vehicleId)}</td><td className="p-3">{x.type}</td><td className="p-3">{x.odo || '—'}</td><td className="p-3">{x.cost === '' ? '—' : Number(x.cost).toFixed(2)}</td><td className="p-3 text-[#9db4d9]">{x.notes}</td>
+                <td className="p-3"><button onClick={() => setLogs(logs.filter((y) => y.id !== x.id))} aria-label="Delete log" className="text-[#6b86b8] hover:text-rose-400"><Trash2 className="w-4 h-4" /></button></td></tr>
+            ))}</tbody></table>
+        </div>
+      )}
+    </Page>
+  );
+}
+
+/* =====================================================================
+   LOGIN / REGISTER / DASHBOARD / PRICING
+   ===================================================================== */
+function LoginView() {
+  const { register, login, navigate, notify } = useApp();
+  const [mode, setMode] = useState('login');
+  const [f, setF] = useState({ name: '', email: '', pw: '' });
+  const [err, setErr] = useState('');
+  const [busy, setBusy] = useState(false);
+  const submit = async (e) => {
+    e.preventDefault(); setBusy(true); setErr('');
+    const m = mode === 'login' ? await login(f.email, f.pw) : await register(f.name, f.email, f.pw);
+    setBusy(false);
+    if (m) setErr(m); else { notify(mode === 'login' ? 'Welcome back!' : 'Account created'); navigate('dashboard'); }
+  };
+  return (
+    <div className="max-w-md mx-auto px-4 py-14 space-y-5">
+      <div className="text-center space-y-1"><h1 className="text-2xl font-extrabold text-white">{mode === 'login' ? 'Sign in to AutoMind AI' : 'Create your account'}</h1><p className="text-sm text-[#9db4d9]">Keep your plan, scan count and garage together.</p></div>
+      <form onSubmit={submit} className={`${UI.card} p-6 space-y-4`}>
+        {mode === 'register' && <div><label className={UI.label}>Name</label><input value={f.name} onChange={(e) => setF({ ...f, name: e.target.value })} className={UI.input} required /></div>}
+        <div><label className={UI.label}>Email</label><input type="email" autoComplete="email" value={f.email} onChange={(e) => setF({ ...f, email: e.target.value })} className={UI.input} required /></div>
+        <div><label className={UI.label}>Password</label><input type="password" autoComplete={mode === 'login' ? 'current-password' : 'new-password'} value={f.pw} onChange={(e) => setF({ ...f, pw: e.target.value })} className={UI.input} required minLength={6} /></div>
+        {err && <div className="text-sm text-rose-300 flex gap-2"><AlertTriangle className="w-4 h-4 mt-0.5 shrink-0" />{err}</div>}
+        <button disabled={busy} className={UI.primary + ' w-full'}>{busy ? <Loader2 className="w-4 h-4 animate-spin" /> : mode === 'login' ? <LogIn className="w-4 h-4" /> : <User className="w-4 h-4" />}{mode === 'login' ? 'Sign in' : 'Create account'}</button>
+        <button type="button" onClick={() => { setMode(mode === 'login' ? 'register' : 'login'); setErr(''); }} className="w-full text-sm text-sky-400 hover:text-sky-300">{mode === 'login' ? "New here? Create an account" : 'Already have an account? Sign in'}</button>
+        <p className="text-[11px] text-[#7e98c6] text-center">Accounts are stored only in this browser (no server). Clearing site data removes them.</p>
+      </form>
+    </div>
+  );
+}
+
+function DashboardView() {
+  const { profile, garage, logs, navigate, logout } = useApp();
+  const recent = [...logs].sort((a, b) => b.date.localeCompare(a.date)).slice(0, 5);
+  return (
+    <Page icon={LayoutDashboard} title="Dashboard" subtitle={profile.loggedIn ? `Welcome back, ${profile.name} (${profile.email})` : 'You are using AutoMind AI as a guest. Create an account to keep things together.'} width="max-w-6xl">
+      <div className="flex flex-wrap items-center justify-center gap-3">
+        <span className="px-3 py-1 rounded-full text-xs font-bold bg-sky-950 text-sky-300 border border-sky-800">Plan: {profile.subscription}</span>
+        <button onClick={() => navigate('pricing')} className={UI.primary + ' !py-1.5 text-xs'}>Manage plan</button>
+        {profile.loggedIn ? <button onClick={logout} className={UI.ghost + ' !py-1.5 text-xs'}>Sign out</button> : <button onClick={() => navigate('login')} className={UI.ghost + ' !py-1.5 text-xs'}>Sign in / Register</button>}
+      </div>
+      <div className="grid sm:grid-cols-3 gap-4">
+        {[['Vehicles', garage.length, 'text-white'], ['Service logs', logs.length, 'text-sky-400'], ['AI scans this month', `${profile.scansUsed} / ${profile.maxScans === Infinity ? '∞' : profile.maxScans}`, 'text-emerald-400']].map(([a, b, c]) => <div key={a} className={`${UI.card} p-5`}><div className="text-xs text-[#9db4d9]">{a}</div><div className={`text-3xl font-black font-mono ${c}`}>{b}</div></div>)}
+      </div>
+      <div className="grid md:grid-cols-2 gap-5">
+        <div className={`${UI.card} p-5 space-y-3`}><h3 className="font-bold text-white">Garage</h3>{garage.length === 0 ? <p className="text-sm text-[#9db4d9]">No vehicles yet. <button className="text-sky-400 underline" onClick={() => navigate('maintenance')}>Add one</button></p> : garage.map((g) => { const [label, cls] = vehicleStatus(g, logs); return <div key={g.id} className="flex justify-between items-center text-sm"><span>{g.year} {g.make} {g.model}</span><span className={`px-2 py-0.5 rounded-full text-[11px] font-bold border ${cls}`}>{label}</span></div>; })}</div>
+        <div className={`${UI.card} p-5 space-y-3`}><h3 className="font-bold text-white">Recent services</h3>{recent.length === 0 ? <p className="text-sm text-[#9db4d9]">No service logs yet.</p> : recent.map((x) => <div key={x.id} className="flex justify-between text-sm"><span>{x.type}</span><span className="text-[#9db4d9]">{x.date}</span></div>)}</div>
+      </div>
+    </Page>
+  );
+}
+
+function PricingView() {
+  const { profile, choosePlan } = useApp();
+  const plans = [
+    { name: 'Free', tag: 'Basic drivers', price: '$0', per: '/ forever', feats: ['5 AI vision scans / month', 'All text AI tools', 'Garage with up to 2 vehicles', 'English, Urdu & Arabic'] },
+    { name: 'Premium', tag: 'Enthusiasts & drivers', price: '$14.99', per: '/ month', pop: true, feats: ['Unlimited AI vision scans', 'Unlimited garage vehicles & logs', 'All AI tools', 'English, Urdu & Arabic'] },
+    { name: 'Professional', tag: 'Workshops & dealers', price: '$49.99', per: '/ month', feats: ['Everything in Premium', 'Built for workshops managing many vehicles', 'Unlimited scans & service logs'] },
+  ];
+  return (
+    <div className="max-w-6xl mx-auto px-4 py-12 space-y-8">
+      <div className="text-center space-y-2"><span className="text-xs font-bold text-sky-400 uppercase tracking-widest">Plans</span><h1 className="text-3xl font-extrabold text-white">AutoMind AI Subscriptions</h1><p className="text-sm text-[#9db4d9]">Choose the plan that fits how you use AutoMind AI.</p></div>
+      <div className="grid md:grid-cols-3 gap-6">
+        {plans.map((p) => {
+          const active = profile.subscription === p.name;
+          return (
+            <div key={p.name} className={`relative p-7 rounded-3xl bg-[#0a1a3f] flex flex-col justify-between gap-6 ${p.pop ? 'border-2 border-sky-400 shadow-xl shadow-sky-500/10' : 'border border-[#14295c]'}`}>
+              {p.pop && <span className="absolute -top-3 left-1/2 -translate-x-1/2 px-3 py-1 rounded-full bg-sky-400 text-[#03081a] text-[10px] font-black uppercase">Most popular</span>}
+              <div className="space-y-3"><span className="text-xs font-bold uppercase tracking-wider text-sky-400">{p.tag}</span><h3 className="text-2xl font-extrabold text-white">{p.name}</h3><div className="text-3xl font-black text-white font-mono">{p.price} <span className="text-xs text-[#9db4d9] font-normal">{p.per}</span></div>
+                <ul className="space-y-2 text-sm text-[#c3d3ee] pt-3 border-t border-[#14295c]">{p.feats.map((f) => <li key={f} className="flex gap-2"><Check className="w-4 h-4 text-sky-400 mt-0.5 shrink-0" />{f}</li>)}</ul></div>
+              <button disabled={active} onClick={() => choosePlan(p.name)} className={active ? 'w-full py-3 rounded-xl bg-[#14295c] text-sky-300 font-bold text-sm cursor-default' : UI.primary + ' w-full'}>{active ? 'Current plan' : p.name === 'Free' ? 'Switch to Free' : `Upgrade to ${p.name}`}</button>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
